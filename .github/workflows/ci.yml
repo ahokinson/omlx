@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  test:
+    # macOS ARM: mlx-lm wheels are Apple-silicon only, so `uv sync` can't run
+    # on Linux. Tests themselves never load a model (mlx is lazily imported).
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run ty check
+
+      - name: Import sanity (staged tree can be loaded)
+        run: uv run python -c "import omlx.cli, omlx.server, omlx.daemon, omlx.pull, omlx.protocol, omlx._fmt"
+
+      - name: Test
+        run: uv run pytest -q

@@ -1,0 +1,59 @@
+[project]
+name = "omlx"
+dynamic = ["version"]
+description = "Lightweight Ollama alternative on MLX: run HF safetensors models locally, no GGUF"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "mlx-lm>=0.21",
+    "huggingface_hub[hf_xet]>=0.30",
+    "typer>=0.12",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx2>=2.5",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.14",
+]
+
+[project.scripts]
+omlx = "omlx.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "ty>=0.0.58",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/omlx/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omlx"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=omlx --cov-report=term-missing --cov-fail-under=98"
+
+[tool.coverage.report]
+fail_under = 98
+
+[[tool.ty.overrides]]
+# Some tests inject fake mlx modules via sys.modules; attribute access on those
+# dynamic ModuleType fakes can't be resolved statically.
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+unresolved-attribute = "ignore"

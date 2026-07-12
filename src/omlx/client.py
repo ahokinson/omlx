@@ -1,0 +1,38 @@
+"""Thin client for the omlx OpenAI-compatible chat SSE stream."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from typing import Any
+
+import httpx2
+
+_DATA_PREFIX = "data: "
+_DONE = "[DONE]"
+
+
+class StreamError(RuntimeError):
+    """Raised when the server emits an error frame mid-stream."""
+
+
+def stream_chat(url: str, body: dict[str, Any]) -> Iterator[str]:
+    """Yield content deltas from a streaming chat-completions response.
+
+    Raises ``StreamError`` if the server reports an error instead of tokens.
+    """
+    with httpx2.stream("POST", url, json=body, timeout=None) as resp:
+        for line in resp.iter_lines():
+            if not line.startswith(_DATA_PREFIX):
+                continue
+            data = line[len(_DATA_PREFIX) :]
+            if data == _DONE:
+                break
+            obj = json.loads(data)
+            if "error" in obj:
+                raise StreamError(obj["error"]["message"])
+            if not obj.get("choices"):
+                continue
+            delta = obj["choices"][0]["delta"].get("content", "")
+            if delta:
+                yield delta
