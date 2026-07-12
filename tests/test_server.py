@@ -15,16 +15,20 @@ class FakeManager:
     def __init__(
         self,
         chunks=("hel", "lo"),
+        reasonings=None,
         raises=False,
         finish_reason="stop",
         prompt_tokens=5,
         completion_tokens=2,
     ):
         self.chunks = chunks
+        # Per-chunk reasoning deltas, parallel to `chunks`; None => no reasoning.
+        self.reasonings = reasonings
         self.raises = raises
         self.finish_reason = finish_reason
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        self.seen_messages = None  # last messages passed to stream_chat
 
     def loaded(self):
         return "Llama" if not self.raises else None
@@ -54,12 +58,14 @@ class FakeManager:
         for i, c in enumerate(self.chunks):
             yield Completion(
                 text=c,
+                reasoning=self.reasonings[i] if self.reasonings else "",
                 finish_reason=self.finish_reason if i == last else None,
                 prompt_tokens=self.prompt_tokens if i == last else 0,
                 completion_tokens=self.completion_tokens if i == last else 0,
             )
 
-    def stream_chat(self, *a, **k):
+    def stream_chat(self, name, messages, *a, **k):
+        self.seen_messages = messages
         return self._gen()
 
     def stream_text(self, *a, **k):
@@ -233,6 +239,72 @@ def test_chat_stream_sse_framing(client):
     deltas = [f["choices"][0]["delta"].get("content", "") for f in frames if f["choices"]]
     assert "".join(deltas) == "hello"
     assert _usage_frame(frames)["usage"]["total_tokens"] == 7
+
+
+def test_chat_non_stream_includes_reasoning_content(make_client):
+    """A reasoning model's analysis rides `message.reasoning_content`."""
+    r = make_client(chunks=("Hi",), reasonings=("ponder",)).post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    msg = r.json()["choices"][0]["message"]
+    assert msg["content"] == "Hi"
+    assert msg["reasoning_content"] == "ponder"
+
+
+def test_chat_non_stream_omits_reasoning_when_absent(client):
+    """Non-reasoning output keeps the byte-for-byte contract: no reasoning key."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert "reasoning_content" not in r.json()["choices"][0]["message"]
+
+
+def test_chat_stream_includes_reasoning_content(make_client):
+    r = make_client(chunks=("", "Hi"), reasonings=("ponder", "")).post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    frames = _sse_frames(r.text)
+    reasonings = [
+        f["choices"][0]["delta"].get("reasoning_content", "") for f in frames if f["choices"]
+    ]
+    contents = [f["choices"][0]["delta"].get("content", "") for f in frames if f["choices"]]
+    assert "".join(reasonings) == "ponder"
+    assert "".join(contents) == "Hi"
+
+
+def test_chat_stream_omits_reasoning_when_absent(client):
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    frames = _sse_frames(r.text)
+    assert all("reasoning_content" not in f["choices"][0]["delta"] for f in frames if f["choices"])
+
+
+def test_chat_drops_inbound_reasoning_before_templating(make_client):
+    """A client echoing a prior turn's reasoning must not leak it into the prompt."""
+    client = make_client()
+    client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "hello",
+                    "reasoning_content": "<|channel|>analysis<|message|>secret",
+                },
+                {"role": "user", "content": "again"},
+            ],
+        },
+    )
+    seen = server.MANAGER.seen_messages
+    assert all(set(m) == {"role", "content"} for m in seen)  # only role/content templated
+    assert all("<|" not in m["content"] for m in seen)  # no channel text reached the template
 
 
 def test_completions_non_stream(client):

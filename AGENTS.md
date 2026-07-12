@@ -35,6 +35,13 @@ shape, update those tests intentionally, never by accident.
     frame, and a terminal `data: [DONE]\n\n`. Errors mid-stream are emitted as
     `data: {"error": {"message": ..., "type": ...}}` (a 200 stream can't switch
     to an error status late); non-stream errors return HTTP 500.
+  - **Reasoning models (Harmony / gpt-oss)**: the engine parses Harmony output
+    (`engine._HarmonyParser`), stripping control tokens and splitting the
+    `analysis` channel from `final`. Reasoning rides `reasoning_content` on the
+    chat delta (stream) and message (non-stream), present only when non-empty;
+    absent for non-reasoning output. Inbound `reasoning_content` on request
+    `messages` is dropped before `apply_chat_template`. `/v1/completions` has no
+    reasoning field. `tests/test_server.py` pins both presence and absence.
   - Object tags: `chat.completion` / `chat.completion.chunk` for chat;
     `text_completion` for completions.
 - **CLI surface**: `omlx pull|list|rm|run|serve|daemon start|stop|status`.
@@ -72,3 +79,23 @@ shape, update those tests intentionally, never by accident.
 - Ruff line-length 100, target py310. Lint rules: E, F, I, UP, B.
 - Lazy-import mlx / huggingface_hub / uvicorn inside functions that need them
   (the CLI is usable without Apple Silicon for `list`/`rm`/`daemon status`).
+- **Layering**: HTTP routing lives only in `server.py`; MLX is touched only in
+  `engine.py` (and lazily in `pull.py`); `protocol.py` holds the wire shapes and
+  envelope helpers and stays free of routing and MLX. Don't reach across these.
+- **Value objects**: `pydantic.BaseModel` for request bodies at the HTTP
+  boundary — `@dataclass` for everything internal (`Completion`,
+  `SamplingParams`, `LoadedModel`, `ModelEntry`, …). Don't push Pydantic inward.
+- **Type hints on every signature** (`ty check` is a CI gate). Full annotations,
+  not partial.
+- **Docstrings** on every module and public function; module docstrings state
+  the file's role. Comments and docs state non-obvious facts — contract
+  constraints, edge cases, assumptions — not narration or justification of a
+  change. Full-sentence prose.
+- **Private surface**: module-private helpers and constants are `_`-prefixed;
+  constants are `UPPER_SNAKE` with a short explaining comment.
+- **Concurrency** (`ModelManager`): guard shared state with `self._lock`
+  (`RLock`); methods that assume the lock is already held carry a `_locked`
+  suffix. Do slow work (cold model load) *outside* the lock, then re-check state
+  after reacquiring it.
+- **Logging**: one named logger, `logging.getLogger("omlx")`. Tolerated failures
+  (missing Metal, `clear_cache`) are swallowed with `logger.debug`, never raised.

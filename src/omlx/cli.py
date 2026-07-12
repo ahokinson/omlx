@@ -24,8 +24,9 @@ def _stream_once(
     max_tokens: int,
     temperature: float,
 ) -> str:
-    """Stream one chat turn to the daemon, echoing deltas; return the full reply.
+    """Stream one chat turn to the daemon, echoing deltas; return the reply.
 
+    Reasoning deltas are printed dimmed; only the final answer is returned.
     Raises ``StreamError`` on a mid-stream error frame so the caller can decide
     how to handle the failed turn (drop it, exit, etc.). Imports are local so
     tests can monkeypatch ``omlx.client.stream_chat`` after the fact.
@@ -41,9 +42,12 @@ def _stream_once(
     }
     out: list[str] = []
     try:
-        for delta in stream_chat(url, body):
-            typer.echo(delta, nl=False)
-            out.append(delta)
+        for kind, delta in stream_chat(url, body):
+            if kind == "reasoning":
+                typer.echo(typer.style(delta, dim=True), nl=False)
+            else:
+                typer.echo(delta, nl=False)
+                out.append(delta)
     except StreamError as e:
         typer.echo(f"\n[error] {e}", err=True)
         raise

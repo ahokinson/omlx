@@ -171,6 +171,80 @@ def _char_stream(text, finish="stop"):
     return gen
 
 
+def _chunk_stream(chunks, finish="stop"):
+    """A stream_generate stand-in that emits `chunks` verbatim, terminal last."""
+
+    def gen(model, tokenizer, prompt, max_tokens, sampler):
+        last = len(chunks) - 1
+        for i, c in enumerate(chunks):
+            yield types.SimpleNamespace(
+                text=c,
+                finish_reason=finish if i == last else None,
+                prompt_tokens=3,
+                generation_tokens=i + 1,
+            )
+
+    return gen
+
+
+_HARMONY = (
+    "<|channel|>analysis<|message|>THINK<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>ANSWER<|return|>"
+)
+
+
+def _chat(mgr):
+    return list(
+        mgr.stream_chat("A", [{"role": "user", "content": "hi"}], SamplingParams(max_tokens=64))
+    )
+
+
+def test_harmony_splits_reasoning_from_content(fake_mlx, make_entry, monkeypatch):
+    """gpt-oss channels: analysis -> reasoning, final -> content, tokens stripped."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    # One char per step: every control token is split across boundaries.
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream(_HARMONY))
+    out = _chat(ModelManager(start_reaper=False))
+    assert "".join(c.text for c in out) == "ANSWER"
+    assert "".join(c.reasoning for c in out) == "THINK"
+    assert "<|" not in "".join(c.text + c.reasoning for c in out)  # no leaked control tokens
+    assert out[-1].finish_reason == "stop"
+
+
+def test_harmony_control_token_split_across_chunks(fake_mlx, make_entry, monkeypatch):
+    """Multi-char chunks that bisect control tokens still parse cleanly."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    chunks = [
+        "<|chan",
+        "nel|>analysis<|mess",
+        "age|>TH",
+        "INK<|end|><|start|>assistant<|channel|>fin",
+        "al<|message|>ANS",
+        "WER<|return|>",
+    ]
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _chunk_stream(chunks))
+    out = _chat(ModelManager(start_reaper=False))
+    assert "".join(c.text for c in out) == "ANSWER"
+    assert "".join(c.reasoning for c in out) == "THINK"
+
+
+def test_harmony_parser_inert_for_plain_text(fake_mlx, make_entry, monkeypatch):
+    """A non-reasoning model's output is unchanged and produces no reasoning."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream("hello"))
+    out = _chat(ModelManager(start_reaper=False))
+    assert "".join(c.text for c in out) == "hello"
+    assert all(c.reasoning == "" for c in out)
+
+
+def test_harmony_preserves_literal_angle_brackets(fake_mlx, make_entry, monkeypatch):
+    """A bare `<|foo` in content (not a control token) survives intact."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream("a <| b < c"))
+    out = _chat(ModelManager(start_reaper=False))
+    assert "".join(c.text for c in out) == "a <| b < c"
+
+
 def test_stop_sequence_truncates_output(fake_mlx, make_entry, monkeypatch):
     """A stop sequence halts generation and truncates the text at its start."""
     registry.add(make_entry(name="A", repo_id="org/A", path="/p"))

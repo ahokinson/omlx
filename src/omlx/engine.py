@@ -240,12 +240,17 @@ class ModelManager:
     def stream_chat(
         self, name: str, messages: list[dict[str, str]], params: SamplingParams | None = None
     ) -> Iterator[Completion]:
-        """Stream generated tokens for `messages` via the model's chat template."""
+        """Stream generated tokens for `messages` via the model's chat template.
+
+        Output passes through the Harmony parser: the analysis channel is split
+        from the final answer and control tokens are stripped. Inert for
+        non-reasoning models.
+        """
         lm = self.get(name)
         prompt = lm.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False
         )
-        yield from self._stream_prompt(lm, prompt, params or SamplingParams())
+        yield from _parse_harmony(self._stream_prompt(lm, prompt, params or SamplingParams()))
 
     def stream_text(
         self, name: str, prompt: str, params: SamplingParams | None = None
@@ -368,6 +373,141 @@ def _stream_with_stops(gen: Iterator[Any], stops: tuple[str, ...]) -> Iterator[C
             prompt_tokens=last.prompt_tokens,
             completion_tokens=last.generation_tokens,
         )
+
+
+# OpenAI Harmony control tokens (gpt-oss and friends). Stripped from output.
+_HARMONY_CONTROL = (
+    "<|start|>",
+    "<|end|>",
+    "<|message|>",
+    "<|channel|>",
+    "<|constrain|>",
+    "<|return|>",
+    "<|call|>",
+)
+# Channels whose body is chain-of-thought (routed to `reasoning`); anything
+# else (`final`, or an unlabeled body) is the answer (routed to `text`).
+_REASONING_CHANNELS = ("analysis", "commentary")
+
+
+class _HarmonyParser:
+    """Streaming splitter for OpenAI Harmony output (gpt-oss reasoning models).
+
+    Harmony wraps each message in control tokens, e.g.::
+
+        <|channel|>analysis<|message|>THINK<|end|>
+        <|start|>assistant<|channel|>final<|message|>ANSWER<|return|>
+
+    Strips the control tokens and routes the ``analysis``/``commentary``
+    channels to reasoning and the ``final`` channel to content.
+
+    Inert for non-Harmony models: with no control tokens the stream stays in the
+    initial content state and ``reasoning`` stays empty. Assumes Harmony output
+    opens with a control token (gpt-oss does); bare text before the first
+    ``<|channel|>`` / ``<|start|>`` is treated as content.
+
+    Feed deltas with :meth:`push`; call :meth:`flush` once the stream ends to
+    release any tail withheld while disambiguating a split control token.
+    """
+
+    _TEXT, _CHANNEL, _ROLE = range(3)
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._state = self._TEXT
+        self._channel = ""
+        self._to_reasoning = False
+
+    def push(self, text: str) -> tuple[str, str]:
+        """Consume `text`; return (content_delta, reasoning_delta)."""
+        self._buf += text
+        return self._scan(final=False)
+
+    def flush(self) -> tuple[str, str]:
+        """Release any withheld tail at end of stream."""
+        return self._scan(final=True)
+
+    def _emit(self, text: str, content: list[str], reasoning: list[str]) -> None:
+        if self._state == self._CHANNEL:
+            self._channel += text  # collecting the channel name
+        elif self._state == self._ROLE:
+            pass  # role name / suppressed header text
+        elif self._to_reasoning:
+            reasoning.append(text)
+        else:
+            content.append(text)
+
+    def _transition(self, tok: str) -> None:
+        if tok == "<|channel|>":
+            self._state, self._channel = self._CHANNEL, ""
+        elif tok == "<|message|>":
+            self._state = self._TEXT
+            self._to_reasoning = self._channel.strip() in _REASONING_CHANNELS
+        elif tok in ("<|start|>", "<|constrain|>"):
+            self._state = self._ROLE  # suppress the role / constraint header
+        else:  # <|end|>, <|return|>, <|call|> — close the body, await next header
+            self._state, self._channel = self._ROLE, ""
+
+    def _match(self, i: int) -> str | None:
+        for tok in _HARMONY_CONTROL:
+            if self._buf.startswith(tok, i):
+                return tok
+        return None
+
+    def _is_partial(self, i: int) -> bool:
+        frag = self._buf[i:]
+        return any(tok.startswith(frag) for tok in _HARMONY_CONTROL)
+
+    def _scan(self, final: bool) -> tuple[str, str]:
+        content: list[str] = []
+        reasoning: list[str] = []
+        buf = self._buf
+        i, n = 0, len(buf)
+        while i < n:
+            j = buf.find("<", i)
+            if j == -1:
+                self._emit(buf[i:], content, reasoning)
+                i = n
+                break
+            if j > i:
+                self._emit(buf[i:j], content, reasoning)
+                i = j
+            tok = self._match(i)
+            if tok is not None:
+                self._transition(tok)
+                i += len(tok)
+                continue
+            if not final and self._is_partial(i):
+                break  # a control token may be split across chunks; withhold it
+            self._emit(buf[i], content, reasoning)  # a literal '<'
+            i += 1
+        self._buf = buf[i:]
+        return "".join(content), "".join(reasoning)
+
+
+def _parse_harmony(chunks: Iterator[Completion]) -> Iterator[Completion]:
+    """Re-emit `chunks` with Harmony channels split into text vs reasoning.
+
+    Control tokens are stripped; the terminal chunk's `finish_reason` and token
+    counts are preserved. A boundary chunk may carry both a reasoning tail and a
+    content start — both ride the same emitted `Completion`.
+    """
+    parser = _HarmonyParser()
+    for chunk in chunks:
+        content, reasoning = parser.push(chunk.text)
+        terminal = chunk.finish_reason is not None
+        if terminal:
+            tail_content, tail_reasoning = parser.flush()
+            content += tail_content
+            reasoning += tail_reasoning
+        if content or reasoning or terminal:
+            yield Completion(
+                text=content,
+                reasoning=reasoning,
+                finish_reason=chunk.finish_reason,
+                prompt_tokens=chunk.prompt_tokens,
+                completion_tokens=chunk.completion_tokens,
+            )
 
 
 def _estimate_size_bytes(

@@ -63,7 +63,7 @@ def _complete(
             choice=shape.stream_choice,
         )
     try:
-        text, final = collect(stream_fn())
+        content, reasoning, final = collect(stream_fn())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     finish = final.finish_reason if final else "stop"
@@ -72,7 +72,7 @@ def _complete(
         created=created,
         model=req.model,
         obj=shape.nonstream_obj,
-        choices=[shape.terminal_choice(text, finish)],
+        choices=[shape.terminal_choice(content, finish, reasoning)],
         usage_completion=final,
     )
 
@@ -203,7 +203,9 @@ def list_models() -> dict[str, Any]:
 @app.post("/v1/chat/completions", response_model=None)
 def chat_completions(req: ChatRequest) -> StreamingResponse | dict[str, Any]:
     """Chat completion; streams SSE when `stream` is set, else returns JSON."""
-    messages = [m.model_dump() for m in req.messages]
+    # Only role and content reach the chat template; inbound `reasoning_content`
+    # is dropped.
+    messages = [{"role": m.role, "content": m.content} for m in req.messages]
     return _complete(
         req,
         CHAT_SHAPE,

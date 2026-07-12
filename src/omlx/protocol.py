@@ -22,6 +22,9 @@ from pydantic import BaseModel
 class ChatMessage(BaseModel):
     role: str
     content: str
+    # Accepted from clients; dropped before templating (see
+    # ``server.chat_completions``).
+    reasoning_content: str | None = None
 
 
 class ModelRef(BaseModel):
@@ -84,17 +87,22 @@ class SamplingParams:
 class Completion:
     """One streamed generation step.
 
+    `text` is the final-channel (answer) delta; `reasoning` is the analysis-
+    channel (chain-of-thought) delta, empty for non-reasoning models.
     `finish_reason` and the token counts are populated only on the terminal
     step ("stop" for EOS, "length" when truncated at max_tokens).
     """
 
     text: str
+    reasoning: str = ""
     finish_reason: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
 
-ChoiceBuilder = Callable[[str, str | None], dict[str, Any]]
+# (content, finish[, reasoning]) -> choice dict. Chat builders take the optional
+# trailing ``reasoning``; the text-completion builder ignores it.
+ChoiceBuilder = Callable[..., dict[str, Any]]
 
 
 def _now() -> int:
@@ -109,20 +117,28 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _chat_choice(content: str, finish: str | None) -> dict[str, Any]:
-    delta = {"content": content} if finish is None else {}
-    return {"index": 0, "delta": delta, "finish_reason": finish}
+def _chat_choice(content: str, finish: str | None, reasoning: str = "") -> dict[str, Any]:
+    # Terminal frame: empty delta. Otherwise include `content` / `reasoning_content`
+    # only when non-empty.
+    if finish is not None:
+        return {"index": 0, "delta": {}, "finish_reason": finish}
+    delta: dict[str, Any] = {}
+    if content:
+        delta["content"] = content
+    if reasoning:
+        delta["reasoning_content"] = reasoning
+    return {"index": 0, "delta": delta, "finish_reason": None}
 
 
-def _chat_message_choice(content: str, finish: str | None) -> dict[str, Any]:
-    return {
-        "index": 0,
-        "message": {"role": "assistant", "content": content},
-        "finish_reason": finish,
-    }
+def _chat_message_choice(content: str, finish: str | None, reasoning: str = "") -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return {"index": 0, "message": message, "finish_reason": finish}
 
 
-def _text_choice(content: str, finish: str | None) -> dict[str, Any]:
+def _text_choice(content: str, finish: str | None, reasoning: str = "") -> dict[str, Any]:
+    # Text completions have no reasoning field; `reasoning` is ignored.
     return {"index": 0, "text": content, "finish_reason": finish}
 
 
@@ -202,8 +218,8 @@ def sse_response(
         try:
             final: Completion | None = None
             for chunk in chunks:
-                if chunk.text:
-                    yield _sse(envelope([choice(chunk.text, None)], None))
+                if chunk.text or chunk.reasoning:
+                    yield _sse(envelope([choice(chunk.text, None, chunk.reasoning)], None))
                 if chunk.finish_reason is not None:
                     final = chunk
             finish = final.finish_reason if final else "stop"
@@ -217,19 +233,21 @@ def sse_response(
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-def collect(chunks: Iterator[Completion]) -> tuple[str, Completion | None]:
-    """Drain a token stream to (text, terminal completion).
+def collect(chunks: Iterator[Completion]) -> tuple[str, str, Completion | None]:
+    """Drain a token stream to (content, reasoning, terminal completion).
 
     Lets generator exceptions propagate so the caller (the HTTP layer) can
     map them to a 500; this keeps the protocol module free of HTTP concerns.
     """
-    parts: list[str] = []
+    content: list[str] = []
+    reasoning: list[str] = []
     final: Completion | None = None
     for chunk in chunks:
-        parts.append(chunk.text)
+        content.append(chunk.text)
+        reasoning.append(chunk.reasoning)
         if chunk.finish_reason is not None:
             final = chunk
-    return "".join(parts), final
+    return "".join(content), "".join(reasoning), final
 
 
 def json_response(

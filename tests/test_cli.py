@@ -61,7 +61,10 @@ def test_rm_unknown_model_exits_1(runner):
 
 def test_run_one_shot_streams_reply(runner, monkeypatch):
     monkeypatch.setattr("omlx.daemon.ensure_running", lambda: None)
-    monkeypatch.setattr("omlx.client.stream_chat", lambda url, body: iter(["Hello", " world"]))
+    monkeypatch.setattr(
+        "omlx.client.stream_chat",
+        lambda url, body: iter([("content", "Hello"), ("content", " world")]),
+    )
     result = runner.invoke(app, ["run", "M", "-p", "hi"])
     assert result.exit_code == 0
     assert "Hello world" in result.stdout
@@ -77,7 +80,10 @@ def test_serve_invokes_uvicorn(runner, monkeypatch):
 
 
 def test_stream_once_streams_deltas_and_returns_full_reply(monkeypatch, capsys):
-    monkeypatch.setattr("omlx.client.stream_chat", lambda url, body: iter(["Hello", " world"]))
+    monkeypatch.setattr(
+        "omlx.client.stream_chat",
+        lambda url, body: iter([("content", "Hello"), ("content", " world")]),
+    )
     out = _stream_once(
         "http://x/v1/chat/completions",
         "M",
@@ -87,6 +93,21 @@ def test_stream_once_streams_deltas_and_returns_full_reply(monkeypatch, capsys):
     )
     assert out == "Hello world"
     assert "Hello world" in capsys.readouterr().out
+
+
+def test_stream_once_dims_reasoning_and_returns_content_only(monkeypatch, capsys):
+    """Reasoning deltas print (dimmed) but are excluded from the returned reply."""
+    monkeypatch.setattr(
+        "omlx.client.stream_chat",
+        lambda url, body: iter([("reasoning", "pondering"), ("content", "Hi")]),
+    )
+    out = _stream_once(
+        "http://x", "M", [{"role": "user", "content": "hi"}], max_tokens=8, temperature=0.5
+    )
+    # Only the final answer is kept for history; reasoning is not.
+    assert out == "Hi"
+    stdout = capsys.readouterr().out
+    assert "pondering" in stdout and "Hi" in stdout
 
 
 def test_stream_once_propagates_stream_error(monkeypatch):
@@ -149,7 +170,7 @@ def test_run_one_shot_streamerror_exits_1(runner, monkeypatch):
 
 def test_run_interactive_bye_exits_cleanly(runner, monkeypatch):
     monkeypatch.setattr("omlx.daemon.ensure_running", lambda: None)
-    monkeypatch.setattr("omlx.client.stream_chat", lambda url, body: iter(["reply"]))
+    monkeypatch.setattr("omlx.client.stream_chat", lambda url, body: iter([("content", "reply")]))
     result = runner.invoke(app, ["run", "M"], input="hi\n/bye\n")
     assert result.exit_code == 0
     assert "reply" in result.stdout
@@ -160,7 +181,7 @@ def test_run_interactive_eof_breaks(runner, monkeypatch):
     typer.prompt to raise a genuine EOFError and exercise the handler.
     """
     monkeypatch.setattr("omlx.daemon.ensure_running", lambda: None)
-    monkeypatch.setattr("omlx.client.stream_chat", lambda url, body: iter(["reply"]))
+    monkeypatch.setattr("omlx.client.stream_chat", lambda url, body: iter([("content", "reply")]))
 
     def _eof(*a, **k):
         raise EOFError
@@ -180,7 +201,7 @@ def test_run_interactive_streamerror_drops_turn(runner, monkeypatch):
         if calls["n"] == 1:
             raise StreamError("boom")
             yield
-        yield "ok"
+        yield ("content", "ok")
 
     monkeypatch.setattr("omlx.client.stream_chat", _stream)
     result = runner.invoke(app, ["run", "M"], input="hi\nagain\n/bye\n")

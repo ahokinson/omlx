@@ -16,9 +16,11 @@ class StreamError(RuntimeError):
     """Raised when the server emits an error frame mid-stream."""
 
 
-def stream_chat(url: str, body: dict[str, Any]) -> Iterator[str]:
-    """Yield content deltas from a streaming chat-completions response.
+def stream_chat(url: str, body: dict[str, Any]) -> Iterator[tuple[str, str]]:
+    """Yield ``(kind, text)`` deltas from a streaming chat-completions response.
 
+    ``kind`` is ``"reasoning"`` for chain-of-thought deltas (reasoning models)
+    or ``"content"`` for the answer. Reasoning precedes content within a frame.
     Raises ``StreamError`` if the server reports an error instead of tokens.
     """
     with httpx2.stream("POST", url, json=body, timeout=None) as resp:
@@ -33,6 +35,10 @@ def stream_chat(url: str, body: dict[str, Any]) -> Iterator[str]:
                 raise StreamError(obj["error"]["message"])
             if not obj.get("choices"):
                 continue
-            delta = obj["choices"][0]["delta"].get("content", "")
-            if delta:
-                yield delta
+            delta = obj["choices"][0]["delta"]
+            reasoning = delta.get("reasoning_content", "")
+            if reasoning:
+                yield "reasoning", reasoning
+            content = delta.get("content", "")
+            if content:
+                yield "content", content

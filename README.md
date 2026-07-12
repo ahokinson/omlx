@@ -59,6 +59,19 @@ client.chat.completions.create(
 Endpoints: `GET /v1/models`, `POST /v1/chat/completions` (stream + non-stream),
 `POST /v1/completions`, `GET /health`.
 
+## Reasoning models
+
+Reasoning models that emit OpenAI **Harmony** format (e.g. `gpt-oss`) are
+supported. The chain-of-thought (the `analysis` channel) is split from the
+answer (the `final` channel) and the control tokens are stripped:
+
+- `omlx run` prints the thinking **dimmed**, then the answer.
+- `/v1/chat/completions` returns the thinking in `reasoning_content` (on the
+  message for non-stream, on the delta for stream), alongside `content`. The
+  field is present only when the model reasons.
+- A prior turn's `reasoning_content` sent back in `messages` is dropped before
+  templating.
+
 ## How it works
 
 - **Storage** reuses the HF hub cache (`~/.cache/huggingface/hub`); a small
