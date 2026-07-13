@@ -7,7 +7,7 @@ import types
 import pytest
 
 from omlx import engine, registry
-from omlx.engine import ModelManager, SamplingParams
+from omlx.engine import Completion, ModelManager, SamplingParams
 
 
 class FakeTokenizer:
@@ -337,6 +337,119 @@ def test_stream_chat_without_tool_support_ignores_tools(fake_mlx, make_entry, mo
     )
     assert "".join(c.text for c in out) == "<tool_call>x</tool_call>"
     assert [tc for c in out for tc in c.tool_calls] == []
+
+
+def test_parse_tool_calls_passthrough_without_markers():
+    """No start marker / parser => chunks pass through untouched (defensive guard)."""
+    chunks = [Completion(text="hi", finish_reason="stop")]
+    out = list(engine._parse_tool_calls(iter(chunks), None, None, None, None))
+    assert out == chunks
+
+
+class FakeHarmonyTokenizer:
+    """gpt-oss: reports no has_tool_calling; Harmony support inferred from vocab."""
+
+    has_tool_calling = False
+
+    def __init__(self):
+        self.seen_tools = None
+
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, tools=None):
+        self.seen_tools = tools
+        return "PROMPT"
+
+    def get_vocab(self):
+        return {"<|call|>": 1}
+
+
+def _load_harmony_tokenizer(monkeypatch):
+    tok = FakeHarmonyTokenizer()
+    monkeypatch.setattr(sys.modules["mlx_lm"], "load", lambda source: (object(), tok))
+    return tok
+
+
+_HARMONY_TOOL = (
+    "<|channel|>commentary to=functions.get_weather<|constrain|>json"
+    '<|message|>{"city": "SF"}<|call|>'
+)
+
+
+def test_harmony_offers_tools_via_vocab_probe(fake_mlx, make_entry, monkeypatch):
+    """gpt-oss has no has_tool_calling, yet tools still reach the template."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    tok = _load_harmony_tokenizer(monkeypatch)
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream("hi"))
+    tools = [{"type": "function", "function": {"name": "get_weather"}}]
+    _tool_chat(ModelManager(start_reaper=False), tools)
+    assert tok.seen_tools == tools
+
+
+def test_harmony_parses_tool_call(fake_mlx, make_entry, monkeypatch):
+    """A commentary to=functions call becomes a tool_call; args don't leak to content.
+
+    `_char_stream` emits one char per step, so every control token is split — this
+    also guards the streaming path.
+    """
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_harmony_tokenizer(monkeypatch)
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream(_HARMONY_TOOL))
+    out = _tool_chat(
+        ModelManager(start_reaper=False),
+        [{"type": "function", "function": {"name": "get_weather"}}],
+    )
+    calls = [tc for c in out for tc in c.tool_calls]
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "SF"}
+    assert "".join(c.text for c in out) == ""
+    assert out[-1].finish_reason == "tool_calls"
+
+
+def test_harmony_reasoning_then_tool_call(fake_mlx, make_entry, monkeypatch):
+    """An analysis block still routes to reasoning while a following call is captured."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_harmony_tokenizer(monkeypatch)
+    body = (
+        "<|channel|>analysis<|message|>THINK<|end|>"
+        "<|start|>assistant<|channel|>commentary to=functions.f<|message|>{}<|call|>"
+    )
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream(body))
+    out = _tool_chat(
+        ModelManager(start_reaper=False), [{"type": "function", "function": {"name": "f"}}]
+    )
+    assert "".join(c.reasoning for c in out) == "THINK"
+    assert "".join(c.text for c in out) == ""
+    calls = [tc for c in out for tc in c.tool_calls]
+    assert len(calls) == 1 and calls[0]["function"]["name"] == "f"
+    assert out[-1].finish_reason == "tool_calls"
+
+
+def test_harmony_multiple_tool_calls(fake_mlx, make_entry, monkeypatch):
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_harmony_tokenizer(monkeypatch)
+    body = (
+        "<|channel|>commentary to=functions.a<|message|>{}<|call|>"
+        "<|start|>assistant<|channel|>commentary to=functions.b<|message|>{}<|call|>"
+    )
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream(body))
+    out = _tool_chat(
+        ModelManager(start_reaper=False), [{"type": "function", "function": {"name": "a"}}]
+    )
+    names = [tc["function"]["name"] for c in out for tc in c.tool_calls]
+    assert names == ["a", "b"]
+
+
+def test_harmony_plain_answer_yields_no_tool_calls(fake_mlx, make_entry, monkeypatch):
+    """A normal Harmony answer (no commentary call) produces no tool_calls, finish stop."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_harmony_tokenizer(monkeypatch)
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream(_HARMONY))
+    out = _tool_chat(
+        ModelManager(start_reaper=False), [{"type": "function", "function": {"name": "f"}}]
+    )
+    assert [tc for c in out for tc in c.tool_calls] == []
+    assert "".join(c.text for c in out) == "ANSWER"
+    assert out[-1].finish_reason == "stop"
 
 
 def test_stop_sequence_truncates_output(fake_mlx, make_entry, monkeypatch):

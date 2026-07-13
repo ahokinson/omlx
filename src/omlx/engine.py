@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -256,13 +257,16 @@ class ModelManager:
         """
         lm = self.get(name)
         tok = lm.tokenizer
-        use_tools = bool(tools) and getattr(tok, "has_tool_calling", False)
+        # gpt-oss reports no `has_tool_calling` (Harmony has no mlx-lm tool parser);
+        # its calls are parsed from the commentary channel in `_parse_harmony`.
+        generic_tools = bool(tools) and getattr(tok, "has_tool_calling", False)
+        offer_tools = bool(tools) and (generic_tools or _is_harmony(tok))
         template_kwargs: dict[str, Any] = {"add_generation_prompt": True, "tokenize": False}
-        if use_tools:
+        if offer_tools:
             template_kwargs["tools"] = tools
         prompt = tok.apply_chat_template(messages, **template_kwargs)
         stream = _parse_harmony(self._stream_prompt(lm, prompt, params or SamplingParams()))
-        if use_tools:
+        if generic_tools:
             stream = _parse_tool_calls(
                 stream,
                 getattr(tok, "tool_call_start", None),
@@ -409,6 +413,28 @@ _HARMONY_CONTROL = (
 # else (`final`, or an unlabeled body) is the answer (routed to `text`).
 _REASONING_CHANNELS = ("analysis", "commentary")
 
+# A Harmony tool call rides the commentary channel with a `to=functions.NAME`
+# recipient, e.g. `<|channel|>commentary to=functions.get_weather<|message|>`.
+_HARMONY_TOOL_RE = re.compile(r"to=functions\.([\w.-]+)")
+
+
+def _harmony_tool_name(channel: str) -> str | None:
+    """The function name if `channel` is a `to=functions.NAME` tool header, else None."""
+    m = _HARMONY_TOOL_RE.search(channel)
+    return m.group(1) if m else None
+
+
+def _is_harmony(tok: Any) -> bool:
+    """True when the tokenizer speaks Harmony (gpt-oss), by probing its vocab.
+
+    gpt-oss reports no `has_tool_calling`, so this is the pre-generation signal
+    for whether to offer tools to the chat template.
+    """
+    try:
+        return "<|call|>" in tok.get_vocab()
+    except Exception:
+        return False
+
 
 class _HarmonyParser:
     """Streaming splitter for OpenAI Harmony output (gpt-oss reasoning models).
@@ -419,7 +445,10 @@ class _HarmonyParser:
         <|start|>assistant<|channel|>final<|message|>ANSWER<|return|>
 
     Strips the control tokens and routes the ``analysis``/``commentary``
-    channels to reasoning and the ``final`` channel to content.
+    channels to reasoning and the ``final`` channel to content. A commentary
+    header with a ``to=functions.NAME`` recipient is a tool call: its body is
+    captured and emitted as an OpenAI ``tool_calls`` entry at the closing
+    ``<|call|>`` rather than as content or reasoning.
 
     Inert for non-Harmony models: with no control tokens the stream stays in the
     initial content state and ``reasoning`` stays empty. Assumes Harmony output
@@ -437,13 +466,19 @@ class _HarmonyParser:
         self._state = self._TEXT
         self._channel = ""
         self._to_reasoning = False
+        # Tool-call capture: name from the channel header, body accumulated until
+        # the closing token; finished calls queue in `_pending` for the next scan.
+        self._tool_active = False
+        self._tool_name = ""
+        self._tool_args: list[str] = []
+        self._pending: list[dict[str, Any]] = []
 
-    def push(self, text: str) -> tuple[str, str]:
-        """Consume `text`; return (content_delta, reasoning_delta)."""
+    def push(self, text: str) -> tuple[str, str, list[dict[str, Any]]]:
+        """Consume `text`; return (content_delta, reasoning_delta, tool_calls)."""
         self._buf += text
         return self._scan(final=False)
 
-    def flush(self) -> tuple[str, str]:
+    def flush(self) -> tuple[str, str, list[dict[str, Any]]]:
         """Release any withheld tail at end of stream."""
         return self._scan(final=True)
 
@@ -452,20 +487,35 @@ class _HarmonyParser:
             self._channel += text  # collecting the channel name
         elif self._state == self._ROLE:
             pass  # role name / suppressed header text
+        elif self._tool_active:
+            self._tool_args.append(text)  # tool-call arguments body
         elif self._to_reasoning:
             reasoning.append(text)
         else:
             content.append(text)
+
+    def _close_tool(self) -> None:
+        self._pending.append(
+            _format_tool_call({"name": self._tool_name, "arguments": "".join(self._tool_args)})
+        )
+        self._tool_active, self._tool_name, self._tool_args = False, "", []
 
     def _transition(self, tok: str) -> None:
         if tok == "<|channel|>":
             self._state, self._channel = self._CHANNEL, ""
         elif tok == "<|message|>":
             self._state = self._TEXT
-            self._to_reasoning = self._channel.strip() in _REASONING_CHANNELS
+            name = _harmony_tool_name(self._channel)
+            if name is not None:
+                self._tool_active, self._tool_name, self._tool_args = True, name, []
+                self._to_reasoning = False
+            else:
+                self._to_reasoning = self._channel.strip() in _REASONING_CHANNELS
         elif tok in ("<|start|>", "<|constrain|>"):
             self._state = self._ROLE  # suppress the role / constraint header
         else:  # <|end|>, <|return|>, <|call|> — close the body, await next header
+            if self._tool_active:
+                self._close_tool()
             self._state, self._channel = self._ROLE, ""
 
     def _match(self, i: int) -> str | None:
@@ -478,7 +528,7 @@ class _HarmonyParser:
         frag = self._buf[i:]
         return any(tok.startswith(frag) for tok in _HARMONY_CONTROL)
 
-    def _scan(self, final: bool) -> tuple[str, str]:
+    def _scan(self, final: bool) -> tuple[str, str, list[dict[str, Any]]]:
         content: list[str] = []
         reasoning: list[str] = []
         buf = self._buf
@@ -502,31 +552,42 @@ class _HarmonyParser:
             self._emit(buf[i], content, reasoning)  # a literal '<'
             i += 1
         self._buf = buf[i:]
-        return "".join(content), "".join(reasoning)
+        calls, self._pending = self._pending, []
+        return "".join(content), "".join(reasoning), calls
 
 
 def _parse_harmony(chunks: Iterator[Completion]) -> Iterator[Completion]:
-    """Re-emit `chunks` with Harmony channels split into text vs reasoning.
+    """Re-emit `chunks` with Harmony channels split into text, reasoning, tool calls.
 
     Control tokens are stripped; the terminal chunk's `finish_reason` and token
     counts are preserved. A boundary chunk may carry both a reasoning tail and a
-    content start — both ride the same emitted `Completion`.
+    content start — both ride the same emitted `Completion`. A commentary tool
+    call becomes a `tool_calls` entry and flips the terminal `finish_reason` to
+    ``"tool_calls"`` (OpenAI contract).
     """
     parser = _HarmonyParser()
+    saw_tool = False
     for chunk in chunks:
-        content, reasoning = parser.push(chunk.text)
+        content, reasoning, calls = parser.push(chunk.text)
         terminal = chunk.finish_reason is not None
         if terminal:
-            tail_content, tail_reasoning = parser.flush()
+            tail_content, tail_reasoning, tail_calls = parser.flush()
             content += tail_content
             reasoning += tail_reasoning
-        if content or reasoning or terminal:
+            calls += tail_calls
+        if calls:
+            saw_tool = True
+        finish = chunk.finish_reason
+        if terminal and saw_tool and finish == "stop":
+            finish = "tool_calls"
+        if content or reasoning or calls or terminal:
             yield Completion(
                 text=content,
                 reasoning=reasoning,
-                finish_reason=chunk.finish_reason,
+                finish_reason=finish,
                 prompt_tokens=chunk.prompt_tokens,
                 completion_tokens=chunk.completion_tokens,
+                tool_calls=tuple(calls),
             )
 
 

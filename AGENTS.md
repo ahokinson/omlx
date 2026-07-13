@@ -42,6 +42,19 @@ shape, update those tests intentionally, never by accident.
     absent for non-reasoning output. Inbound `reasoning_content` on request
     `messages` is dropped before `apply_chat_template`. `/v1/completions` has no
     reasoning field. `tests/test_server.py` pins both presence and absence.
+  - **Tool / function calling**: `/v1/chat/completions` accepts OpenAI `tools`
+    and `tool_choice`, plus the full OpenAI message shape — `content` as a
+    string, a structured parts array, or null; `role: "tool"` results; and
+    assistant `tool_calls`. `protocol.ChatMessage.to_template_dict` flattens
+    these for `apply_chat_template` (parts joined, null -> `""`, tool-call
+    `arguments` decoded to an object). Emitted calls ride `tool_calls` (on the
+    delta for stream, with a running `index`; on the message for non-stream,
+    without `index`) and flip `finish_reason` to `"tool_calls"`. Two parse
+    paths: mainstream models via mlx-lm's per-model `tokenizer.tool_parser` +
+    `tool_call_start`/`tool_call_end` (gated on `tokenizer.has_tool_calling`,
+    `engine._parse_tool_calls`); gpt-oss/Harmony via the commentary
+    `to=functions.NAME` channel (`engine._HarmonyParser`). Absent when no
+    tools/calls. `tests/test_server.py` and `tests/test_engine.py` pin it.
   - Object tags: `chat.completion` / `chat.completion.chunk` for chat;
     `text_completion` for completions.
 - **CLI surface**: `omlx pull|list|rm|run|serve|daemon start|stop|status`.

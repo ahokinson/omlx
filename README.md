@@ -72,6 +72,27 @@ answer (the `final` channel) and the control tokens are stripped:
 - A prior turn's `reasoning_content` sent back in `messages` is dropped before
   templating.
 
+## Tool calling
+
+`/v1/chat/completions` supports OpenAI **function calling**, so agentic clients
+like [opencode](https://github.com/sst/opencode) work as a drop-in. Pass `tools`;
+when the model invokes one, the response carries `tool_calls` and
+`finish_reason: "tool_calls"`.
+
+```python
+client.chat.completions.create(
+    model="mlx-community/Qwen2.5-7B-Instruct-4bit",
+    messages=[{"role": "user", "content": "weather in SF?"}],
+    tools=[{"type": "function", "function": {"name": "get_weather", ...}}],
+)
+```
+
+- **Tool-capable models** (Qwen, Mistral, Llama, GLM, …) are parsed via
+  `mlx-lm`'s per-model tool parsers.
+- **gpt-oss / Harmony** tool calls (the `commentary` channel) are supported too.
+- The full OpenAI message shape is accepted on input: `content` as a string or a
+  structured parts array, `null` content, and `role: "tool"` results.
+
 ## How it works
 
 - **Storage** reuses the HF hub cache (`~/.cache/huggingface/hub`); a small
