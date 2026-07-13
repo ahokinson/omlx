@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
+import uuid
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -238,19 +240,37 @@ class ModelManager:
         return out
 
     def stream_chat(
-        self, name: str, messages: list[dict[str, str]], params: SamplingParams | None = None
+        self,
+        name: str,
+        messages: list[dict[str, Any]],
+        params: SamplingParams | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Iterator[Completion]:
         """Stream generated tokens for `messages` via the model's chat template.
 
         Output passes through the Harmony parser: the analysis channel is split
         from the final answer and control tokens are stripped. Inert for
-        non-reasoning models.
+        non-reasoning models. When `tools` is given and the tokenizer supports
+        tool calling, tools are offered to the template and tool-call spans in
+        the output are parsed into OpenAI `tool_calls`.
         """
         lm = self.get(name)
-        prompt = lm.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False
-        )
-        yield from _parse_harmony(self._stream_prompt(lm, prompt, params or SamplingParams()))
+        tok = lm.tokenizer
+        use_tools = bool(tools) and getattr(tok, "has_tool_calling", False)
+        template_kwargs: dict[str, Any] = {"add_generation_prompt": True, "tokenize": False}
+        if use_tools:
+            template_kwargs["tools"] = tools
+        prompt = tok.apply_chat_template(messages, **template_kwargs)
+        stream = _parse_harmony(self._stream_prompt(lm, prompt, params or SamplingParams()))
+        if use_tools:
+            stream = _parse_tool_calls(
+                stream,
+                getattr(tok, "tool_call_start", None),
+                getattr(tok, "tool_call_end", None),
+                getattr(tok, "tool_parser", None),
+                tools,
+            )
+        yield from stream
 
     def stream_text(
         self, name: str, prompt: str, params: SamplingParams | None = None
@@ -507,6 +527,138 @@ def _parse_harmony(chunks: Iterator[Completion]) -> Iterator[Completion]:
                 finish_reason=chunk.finish_reason,
                 prompt_tokens=chunk.prompt_tokens,
                 completion_tokens=chunk.completion_tokens,
+            )
+
+
+def _tool_partial_suffix(buf: str, delim: str) -> int:
+    """Length of the longest tail of `buf` that is a proper prefix of `delim`.
+
+    A delimiter can be split across generation steps; this is how many trailing
+    chars to withhold until the next step disambiguates them.
+    """
+    for k in range(min(len(buf), len(delim) - 1), 0, -1):
+        if buf.endswith(delim[:k]):
+            return k
+    return 0
+
+
+def _format_tool_call(tc: dict[str, Any]) -> dict[str, Any]:
+    """One parser result -> OpenAI `tool_calls` entry (arguments as a JSON string)."""
+    args = tc.get("arguments", {})
+    return {
+        "id": tc.get("id") or f"call_{uuid.uuid4().hex}",
+        "type": "function",
+        "function": {
+            "name": tc.get("name", ""),
+            "arguments": args if isinstance(args, str) else json.dumps(args, ensure_ascii=False),
+        },
+    }
+
+
+class _ToolCallParser:
+    """Streaming splitter for a model's tool-call spans.
+
+    Text between the tokenizer's ``tool_call_start`` and ``tool_call_end`` markers
+    is routed to the per-model ``parse`` callable and emitted as OpenAI-shaped
+    tool calls; everything else is content. A start marker with no ``end`` runs to
+    the end of the stream. A span that fails to parse (truncated mid-generation)
+    is dropped.
+    """
+
+    def __init__(self, start: str, end: str | None, parse: Callable[..., Any], tools: Any) -> None:
+        self._start = start
+        self._end = end
+        self._parse = parse
+        self._tools = tools
+        self._buf = ""
+        self._in_tool = False
+
+    def push(self, text: str) -> tuple[str, list[dict[str, Any]]]:
+        self._buf += text
+        return self._scan(final=False)
+
+    def flush(self) -> tuple[str, list[dict[str, Any]]]:
+        return self._scan(final=True)
+
+    def _parse_into(self, text: str, out: list[dict[str, Any]]) -> None:
+        try:
+            parsed = self._parse(text, self._tools)
+        except (ValueError, json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.warning("failed to parse tool call (%s); likely truncated", e)
+            return
+        for tc in parsed if isinstance(parsed, list) else [parsed]:
+            out.append(_format_tool_call(tc))
+
+    def _scan(self, final: bool) -> tuple[str, list[dict[str, Any]]]:
+        content: list[str] = []
+        calls: list[dict[str, Any]] = []
+        while True:
+            if not self._in_tool:
+                i = self._buf.find(self._start)
+                if i == -1:
+                    keep = 0 if final else _tool_partial_suffix(self._buf, self._start)
+                    cut = len(self._buf) - keep
+                    content.append(self._buf[:cut])
+                    self._buf = self._buf[cut:]
+                    break
+                content.append(self._buf[:i])
+                self._buf = self._buf[i + len(self._start) :]
+                self._in_tool = True
+            else:
+                j = self._buf.find(self._end) if self._end else -1
+                if self._end and j != -1:
+                    self._parse_into(self._buf[:j], calls)
+                    self._buf = self._buf[j + len(self._end) :]
+                    self._in_tool = False
+                    continue
+                # No end marker yet: hold the span open until it closes or the
+                # stream ends (an end-less tool syntax runs to end of stream).
+                if final:
+                    self._parse_into(self._buf, calls)
+                    self._buf = ""
+                    self._in_tool = False
+                break
+        return "".join(content), calls
+
+
+def _parse_tool_calls(
+    chunks: Iterator[Completion],
+    start: str | None,
+    end: str | None,
+    parse: Callable[..., Any] | None,
+    tools: Any,
+) -> Iterator[Completion]:
+    """Re-emit `chunks` with tool-call spans lifted into `Completion.tool_calls`.
+
+    Content outside the spans passes through unchanged; the terminal
+    `finish_reason` becomes ``"tool_calls"`` once any call was emitted (OpenAI
+    contract). A pass-through when the tokenizer exposes no tool-call markers.
+    """
+    if not start or parse is None:
+        yield from chunks
+        return
+    parser = _ToolCallParser(start, end, parse, tools)
+    saw_tool = False
+    for chunk in chunks:
+        content, calls = parser.push(chunk.text)
+        terminal = chunk.finish_reason is not None
+        if terminal:
+            tail_content, tail_calls = parser.flush()
+            content += tail_content
+            calls += tail_calls
+        if calls:
+            saw_tool = True
+        finish = chunk.finish_reason
+        if terminal and saw_tool and finish == "stop":
+            finish = "tool_calls"
+        if content or calls or chunk.reasoning or terminal:
+            yield Completion(
+                text=content,
+                reasoning=chunk.reasoning,
+                finish_reason=finish,
+                prompt_tokens=chunk.prompt_tokens,
+                completion_tokens=chunk.completion_tokens,
+                tool_calls=tuple(calls),
             )
 
 

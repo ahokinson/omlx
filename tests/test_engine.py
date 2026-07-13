@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -243,6 +244,99 @@ def test_harmony_preserves_literal_angle_brackets(fake_mlx, make_entry, monkeypa
     monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream("a <| b < c"))
     out = _chat(ModelManager(start_reaper=False))
     assert "".join(c.text for c in out) == "a <| b < c"
+
+
+class FakeToolTokenizer:
+    """A tool-capable tokenizer: `<tool_call>`-delimited JSON, echoing tools passed."""
+
+    has_tool_calling = True
+    tool_call_start = "<tool_call>"
+    tool_call_end = "</tool_call>"
+
+    def __init__(self):
+        self.seen_tools = None
+
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, tools=None):
+        self.seen_tools = tools
+        return "PROMPT"
+
+    @staticmethod
+    def tool_parser(text, tools=None):
+        return json.loads(text.strip())
+
+
+def _tool_chat(mgr, tools):
+    return list(
+        mgr.stream_chat(
+            "A", [{"role": "user", "content": "hi"}], SamplingParams(max_tokens=64), tools=tools
+        )
+    )
+
+
+def _load_tool_tokenizer(monkeypatch):
+    tok = FakeToolTokenizer()
+    monkeypatch.setattr(sys.modules["mlx_lm"], "load", lambda source: (object(), tok))
+    return tok
+
+
+def test_stream_chat_parses_tool_call(fake_mlx, make_entry, monkeypatch):
+    """A `<tool_call>` span becomes a tool_call; surrounding text stays content."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    tok = _load_tool_tokenizer(monkeypatch)
+    body = 'pre<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>post'
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream(body))
+    tools = [{"type": "function", "function": {"name": "f"}}]
+    out = _tool_chat(ModelManager(start_reaper=False), tools)
+
+    assert tok.seen_tools == tools  # tools reached the template
+    assert "".join(c.text for c in out) == "prepost"
+    calls = [tc for c in out for tc in c.tool_calls]
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "f"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"x": 1}
+    assert out[-1].finish_reason == "tool_calls"
+
+
+def test_stream_chat_tool_call_split_across_chunks(fake_mlx, make_entry, monkeypatch):
+    """Delimiters bisected across generation steps still parse to one tool call."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_tool_tokenizer(monkeypatch)
+    chunks = ["<tool_", 'call>{"name": "f", ', '"arguments": {}}</tool', "_call>"]
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _chunk_stream(chunks))
+    out = _tool_chat(
+        ModelManager(start_reaper=False), [{"type": "function", "function": {"name": "f"}}]
+    )
+    calls = [tc for c in out for tc in c.tool_calls]
+    assert len(calls) == 1 and calls[0]["function"]["name"] == "f"
+    assert "".join(c.text for c in out) == ""  # no delimiter fragments leaked into content
+
+
+def test_stream_chat_drops_truncated_tool_call(fake_mlx, make_entry, monkeypatch):
+    """An unterminated / unparseable tool span is dropped; finish stays stop."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_tool_tokenizer(monkeypatch)
+    monkeypatch.setattr(
+        sys.modules["mlx_lm"], "stream_generate", _char_stream('<tool_call>{"name": bro')
+    )
+    out = _tool_chat(
+        ModelManager(start_reaper=False), [{"type": "function", "function": {"name": "f"}}]
+    )
+    assert [tc for c in out for tc in c.tool_calls] == []
+    assert out[-1].finish_reason == "stop"
+
+
+def test_stream_chat_without_tool_support_ignores_tools(fake_mlx, make_entry, monkeypatch):
+    """A tokenizer with no tool support leaves output untouched even when tools are passed."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    # Default FakeTokenizer has no has_tool_calling; its <tool_call> text passes through.
+    monkeypatch.setattr(
+        sys.modules["mlx_lm"], "stream_generate", _char_stream("<tool_call>x</tool_call>")
+    )
+    out = _tool_chat(
+        ModelManager(start_reaper=False), [{"type": "function", "function": {"name": "f"}}]
+    )
+    assert "".join(c.text for c in out) == "<tool_call>x</tool_call>"
+    assert [tc for c in out for tc in c.tool_calls] == []
 
 
 def test_stop_sequence_truncates_output(fake_mlx, make_entry, monkeypatch):

@@ -19,12 +19,68 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 
+class ContentPart(BaseModel):
+    """One element of an OpenAI structured-content array (`{"type","text"}`)."""
+
+    type: str
+    text: str | None = None
+
+
+def _decode_tool_call_args(tc: dict[str, Any]) -> dict[str, Any]:
+    """Copy a tool_call with ``function.arguments`` decoded from JSON string to object.
+
+    Chat templates render arguments as an object; the OpenAI wire form is a JSON
+    string. A non-decodable string is left as-is.
+    """
+    out = dict(tc)
+    func = out.get("function")
+    if isinstance(func, dict) and isinstance(func.get("arguments"), str):
+        func = dict(func)
+        try:
+            func["arguments"] = json.loads(func["arguments"]) if func["arguments"] else {}
+        except json.JSONDecodeError:
+            pass
+        out["function"] = func
+    return out
+
+
 class ChatMessage(BaseModel):
+    """One OpenAI chat message: user/assistant/system/tool, with optional tool calls.
+
+    `content` accepts a plain string, a structured content-parts array, or null
+    (an assistant tool-call turn carries its calls in `tool_calls`, not content).
+    """
+
     role: str
-    content: str
+    content: str | list[ContentPart] | None = None
+    name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
     # Accepted from clients; dropped before templating (see
     # ``server.chat_completions``).
     reasoning_content: str | None = None
+
+    def to_template_dict(self) -> dict[str, Any]:
+        """Flatten to the dict shape ``apply_chat_template`` expects.
+
+        Content parts are joined to text and null content becomes ``""``;
+        `reasoning_content` is dropped. `name`, `tool_call_id`, and `tool_calls`
+        ride through only when present, the latter with arguments decoded to an
+        object.
+        """
+        content = self.content
+        if isinstance(content, list):
+            content = "".join(p.text or "" for p in content if p.type == "text")
+        elif content is None:
+            content = ""
+        msg: dict[str, Any] = {"role": self.role, "content": content}
+        if self.name is not None:
+            msg["name"] = self.name
+        if self.tool_call_id is not None:
+            msg["tool_call_id"] = self.tool_call_id
+        if self.tool_calls:
+            msg["tool_calls"] = [_decode_tool_call_args(tc) for tc in self.tool_calls]
+        return msg
 
 
 class ModelRef(BaseModel):
@@ -68,6 +124,10 @@ class _SamplingRequest(BaseModel):
 
 class ChatRequest(_SamplingRequest):
     messages: list[ChatMessage]
+    # OpenAI tool inputs: `tools` is offered to the chat template; `tool_choice`
+    # is accepted for wire compatibility (advisory to the model).
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
 
 
 class CompletionRequest(_SamplingRequest):
@@ -98,6 +158,8 @@ class Completion:
     finish_reason: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # OpenAI-shaped tool calls parsed from this step's output, if any.
+    tool_calls: tuple[dict[str, Any], ...] = ()
 
 
 # (content, finish[, reasoning]) -> choice dict. Chat builders take the optional
@@ -117,9 +179,14 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _chat_choice(content: str, finish: str | None, reasoning: str = "") -> dict[str, Any]:
+def _chat_choice(
+    content: str,
+    finish: str | None,
+    reasoning: str = "",
+    tool_calls: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
     # Terminal frame: empty delta. Otherwise include `content` / `reasoning_content`
-    # only when non-empty.
+    # / `tool_calls` only when non-empty.
     if finish is not None:
         return {"index": 0, "delta": {}, "finish_reason": finish}
     delta: dict[str, Any] = {}
@@ -127,18 +194,33 @@ def _chat_choice(content: str, finish: str | None, reasoning: str = "") -> dict[
         delta["content"] = content
     if reasoning:
         delta["reasoning_content"] = reasoning
+    if tool_calls:
+        delta["tool_calls"] = list(tool_calls)
     return {"index": 0, "delta": delta, "finish_reason": None}
 
 
-def _chat_message_choice(content: str, finish: str | None, reasoning: str = "") -> dict[str, Any]:
+def _chat_message_choice(
+    content: str,
+    finish: str | None,
+    reasoning: str = "",
+    tool_calls: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning:
         message["reasoning_content"] = reasoning
+    if tool_calls:
+        # Non-streaming tool_calls carry no `index` (a streaming-delta concern).
+        message["tool_calls"] = [{k: v for k, v in tc.items() if k != "index"} for tc in tool_calls]
     return {"index": 0, "message": message, "finish_reason": finish}
 
 
-def _text_choice(content: str, finish: str | None, reasoning: str = "") -> dict[str, Any]:
-    # Text completions have no reasoning field; `reasoning` is ignored.
+def _text_choice(
+    content: str,
+    finish: str | None,
+    reasoning: str = "",
+    tool_calls: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
+    # Text completions have no reasoning or tool fields; both are ignored.
     return {"index": 0, "text": content, "finish_reason": finish}
 
 
@@ -217,9 +299,16 @@ def sse_response(
     def gen() -> Iterator[str]:
         try:
             final: Completion | None = None
+            tc_index = 0  # running index across all streamed tool_calls
             for chunk in chunks:
-                if chunk.text or chunk.reasoning:
-                    yield _sse(envelope([choice(chunk.text, None, chunk.reasoning)], None))
+                indexed: tuple[dict[str, Any], ...] = ()
+                if chunk.tool_calls:
+                    indexed = tuple(
+                        {**tc, "index": tc_index + i} for i, tc in enumerate(chunk.tool_calls)
+                    )
+                    tc_index += len(indexed)
+                if chunk.text or chunk.reasoning or indexed:
+                    yield _sse(envelope([choice(chunk.text, None, chunk.reasoning, indexed)], None))
                 if chunk.finish_reason is not None:
                     final = chunk
             finish = final.finish_reason if final else "stop"
@@ -233,21 +322,25 @@ def sse_response(
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-def collect(chunks: Iterator[Completion]) -> tuple[str, str, Completion | None]:
-    """Drain a token stream to (content, reasoning, terminal completion).
+def collect(
+    chunks: Iterator[Completion],
+) -> tuple[str, str, tuple[dict[str, Any], ...], Completion | None]:
+    """Drain a token stream to (content, reasoning, tool_calls, terminal completion).
 
     Lets generator exceptions propagate so the caller (the HTTP layer) can
     map them to a 500; this keeps the protocol module free of HTTP concerns.
     """
     content: list[str] = []
     reasoning: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
     final: Completion | None = None
     for chunk in chunks:
         content.append(chunk.text)
         reasoning.append(chunk.reasoning)
+        tool_calls.extend(chunk.tool_calls)
         if chunk.finish_reason is not None:
             final = chunk
-    return "".join(content), "".join(reasoning), final
+    return "".join(content), "".join(reasoning), tuple(tool_calls), final
 
 
 def json_response(

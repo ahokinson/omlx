@@ -20,6 +20,7 @@ class FakeManager:
         finish_reason="stop",
         prompt_tokens=5,
         completion_tokens=2,
+        tool_calls=None,
     ):
         self.chunks = chunks
         # Per-chunk reasoning deltas, parallel to `chunks`; None => no reasoning.
@@ -28,7 +29,10 @@ class FakeManager:
         self.finish_reason = finish_reason
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        # OpenAI-shaped tool calls to emit on the terminal chunk, if any.
+        self.tool_calls = tool_calls
         self.seen_messages = None  # last messages passed to stream_chat
+        self.seen_tools = None  # last tools passed to stream_chat
 
     def loaded(self):
         return "Llama" if not self.raises else None
@@ -55,17 +59,20 @@ class FakeManager:
         if self.raises:
             raise RuntimeError("boom")
         last = len(self.chunks) - 1
+        terminal_finish = "tool_calls" if self.tool_calls else self.finish_reason
         for i, c in enumerate(self.chunks):
             yield Completion(
                 text=c,
                 reasoning=self.reasonings[i] if self.reasonings else "",
-                finish_reason=self.finish_reason if i == last else None,
+                finish_reason=terminal_finish if i == last else None,
                 prompt_tokens=self.prompt_tokens if i == last else 0,
                 completion_tokens=self.completion_tokens if i == last else 0,
+                tool_calls=tuple(self.tool_calls) if (self.tool_calls and i == last) else (),
             )
 
-    def stream_chat(self, name, messages, *a, **k):
+    def stream_chat(self, name, messages, *a, tools=None, **k):
         self.seen_messages = messages
+        self.seen_tools = tools
         return self._gen()
 
     def stream_text(self, *a, **k):
@@ -305,6 +312,102 @@ def test_chat_drops_inbound_reasoning_before_templating(make_client):
     seen = server.MANAGER.seen_messages
     assert all(set(m) == {"role", "content"} for m in seen)  # only role/content templated
     assert all("<|" not in m["content"] for m in seen)  # no channel text reached the template
+
+
+_TOOL_CALL = {
+    "id": "call_1",
+    "type": "function",
+    "function": {"name": "get_weather", "arguments": '{"city": "NYC"}'},
+}
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": "get_weather", "description": "weather", "parameters": {}},
+    }
+]
+
+
+def test_chat_accepts_content_parts_array(client):
+    """OpenAI structured content (a parts array) is accepted and joined to text."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hi"}, {"type": "text", "text": " there"}],
+                }
+            ],
+        },
+    )
+    assert r.status_code == 200
+    assert server.MANAGER.seen_messages[0]["content"] == "hi there"
+
+
+def test_chat_accepts_null_content_with_tool_calls(client):
+    """An assistant tool-call turn (content null + tool_calls) templates cleanly."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": None, "tool_calls": [_TOOL_CALL]},
+                {"role": "tool", "content": "sunny", "tool_call_id": "call_1"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    seen = server.MANAGER.seen_messages
+    assert seen[1]["content"] == ""
+    # arguments decoded from JSON string to object for the template
+    assert seen[1]["tool_calls"][0]["function"]["arguments"] == {"city": "NYC"}
+    assert seen[2]["role"] == "tool" and seen[2]["tool_call_id"] == "call_1"
+
+
+def test_chat_forwards_tools_to_manager(client):
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}], "tools": _TOOLS},
+    )
+    assert r.status_code == 200
+    assert server.MANAGER.seen_tools == _TOOLS
+
+
+def test_chat_non_stream_tool_calls(make_client):
+    """A tool call surfaces on the message with finish_reason tool_calls, no index key."""
+    r = make_client(chunks=("",), tool_calls=[_TOOL_CALL]).post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}], "tools": _TOOLS},
+    )
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tc = choice["message"]["tool_calls"][0]
+    assert tc == _TOOL_CALL  # id/type/function preserved, no `index`
+    assert "index" not in tc
+
+
+def test_chat_stream_tool_calls(make_client):
+    """Streamed tool calls arrive as delta.tool_calls with an index; finish tool_calls."""
+    r = make_client(chunks=("",), tool_calls=[_TOOL_CALL]).post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+            "stream": True,
+        },
+    )
+    frames = _sse_frames(r.text)
+    tool_deltas = [
+        tc for f in frames if f["choices"] for tc in f["choices"][0]["delta"].get("tool_calls", [])
+    ]
+    assert len(tool_deltas) == 1
+    assert tool_deltas[0]["index"] == 0
+    assert tool_deltas[0]["function"]["name"] == "get_weather"
+    finishes = [f["choices"][0]["finish_reason"] for f in frames if f["choices"]]
+    assert "tool_calls" in finishes
 
 
 def test_completions_non_stream(client):
