@@ -1,11 +1,33 @@
-# omlx: Ollama, for MLX
+# omlx
 
-Swap Ollama's engine for Apple's: `ollama` is `o` + `llama`; `omlx` is `o` +
-`mlx`. A lightweight [Ollama](https://ollama.com) alternative for Apple Silicon,
-backed by [`mlx-lm`](https://github.com/ml-explore/mlx-lm). Pull **any** Hugging Face
-model (Xet-accelerated), serve it over an **OpenAI-compatible** API, keep it
-warm in a background daemon. Runs quantized **safetensors** natively. **No
-GGUF**.
+> Ollama, for MLX — run any Hugging Face model locally on Apple Silicon.
+
+[![CI](https://github.com/ahokinson/omlx/actions/workflows/ci.yml/badge.svg)](https://github.com/ahokinson/omlx/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%20–%203.13-blue.svg)](pyproject.toml)
+[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black.svg)](#install)
+
+A lightweight [Ollama](https://ollama.com) alternative, running on Apple's
+[`mlx-lm`](https://github.com/ml-explore/mlx-lm) engine instead of llama.cpp.
+
+- **Pull any Hugging Face model** — Xet-accelerated downloads, native
+  quantized safetensors. No GGUF.
+- **OpenAI-compatible `/v1` API** on Ollama's port (`11434`) — drop-in for
+  existing clients.
+- **Reasoning and tool calling** — Harmony / gpt-oss chain-of-thought and
+  OpenAI function calling.
+- **Background daemon** — keeps models warm, unloads on idle to free Metal
+  memory.
+
+## Contents
+
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [OpenAI API](#openai-api)
+- [Reasoning models](#reasoning-models)
+- [Tool calling](#tool-calling)
+- [How it works](#how-it-works)
+- [Development](#development)
 
 ## Install
 
@@ -22,30 +44,30 @@ This puts an `omlx` command on your PATH. To hack on it from a clone instead:
 uv sync
 ```
 
-## Use
+## Quickstart
 
 ```sh
 # Pull a model (Xet-accelerated download into the HF cache)
-uv run omlx pull mlx-community/Llama-3.2-1B-Instruct-4bit
+omlx pull mlx-community/Llama-3.2-1B-Instruct-4bit
 
 # List / remove
-uv run omlx list
-uv run omlx rm Llama-3.2-1B-Instruct-4bit
+omlx list
+omlx rm Llama-3.2-1B-Instruct-4bit
 
-# Interactive chat (auto-starts the daemon, keeps the model warm)
-uv run omlx run mlx-community/Llama-3.2-1B-Instruct-4bit
+# Chat (auto-starts the daemon, keeps the model warm). Type /bye to exit.
+omlx run mlx-community/Llama-3.2-1B-Instruct-4bit
 
 # One-shot
-uv run omlx run mlx-community/Llama-3.2-1B-Instruct-4bit --prompt "hi"
+omlx run mlx-community/Llama-3.2-1B-Instruct-4bit --prompt "hi"
 
 # Daemon lifecycle
-uv run omlx daemon start|stop|status
-uv run omlx serve            # foreground
+omlx daemon start|stop|status
+omlx serve            # foreground
 ```
 
 ## OpenAI API
 
-The daemon listens on `http://127.0.0.1:11434/v1` (Ollama's port).
+The daemon listens on `http://127.0.0.1:11434/v1`, so any OpenAI client works:
 
 ```python
 from openai import OpenAI
@@ -61,22 +83,22 @@ Endpoints: `GET /v1/models`, `POST /v1/chat/completions` (stream + non-stream),
 
 ## Reasoning models
 
-Reasoning models that emit OpenAI **Harmony** format (e.g. `gpt-oss`) are
-supported. The chain-of-thought (the `analysis` channel) is split from the
-answer (the `final` channel) and the control tokens are stripped:
+Models that emit OpenAI **Harmony** format (e.g. `gpt-oss`) are supported. The
+chain-of-thought (the `analysis` channel) is split from the answer (the `final`
+channel) and control tokens are stripped:
 
 - `omlx run` prints the thinking **dimmed**, then the answer.
-- `/v1/chat/completions` returns the thinking in `reasoning_content` (on the
-  message for non-stream, on the delta for stream), alongside `content`. The
-  field is present only when the model reasons.
+- `/v1/chat/completions` returns the thinking in `reasoning_content` — on the
+  message for non-stream, on the delta for stream — alongside `content`.
+  Present only when the model reasons.
 - A prior turn's `reasoning_content` sent back in `messages` is dropped before
   templating.
 
 ## Tool calling
 
 `/v1/chat/completions` supports OpenAI **function calling**, so agentic clients
-like [opencode](https://github.com/sst/opencode) work as a drop-in. Pass `tools`;
-when the model invokes one, the response carries `tool_calls` and
+like [opencode](https://github.com/sst/opencode) work as a drop-in. Pass
+`tools`; when the model invokes one, the response carries `tool_calls` and
 `finish_reason: "tool_calls"`.
 
 ```python
@@ -87,9 +109,9 @@ client.chat.completions.create(
 )
 ```
 
-- **Tool-capable models** (Qwen, Mistral, Llama, GLM, …) are parsed via
-  `mlx-lm`'s per-model tool parsers.
-- **gpt-oss / Harmony** tool calls (the `commentary` channel) are supported too.
+- **Tool-capable models** (Qwen, Mistral, Llama, GLM, etc.) parse via `mlx-lm`'s
+  per-model tool parsers.
+- **gpt-oss / Harmony** tool calls are also supported.
 - The full OpenAI message shape is accepted on input: `content` as a string or a
   structured parts array, `null` content, and `role: "tool"` results.
 
@@ -97,8 +119,8 @@ client.chat.completions.create(
 
 - **Storage** reuses the HF hub cache (`~/.cache/huggingface/hub`); a small
   registry at `~/.omlx/models.json` maps friendly names → repos.
-- **Pull** auto-detects MLX-ready repos; use `--convert` to quantize a
-  non-MLX repo on-device via `mlx_lm.convert`.
+- **Pull** auto-detects MLX-ready repos; use `--convert` to quantize a non-MLX
+  repo on-device via `mlx_lm.convert`.
 - **Daemon** lazy-loads models and unloads them after an idle keep-alive TTL,
   freeing Metal memory.
 
@@ -111,6 +133,3 @@ uv run ruff check .    # lint
 uv run ruff format .   # format
 uv run ty check        # type check
 ```
-
-Tests mock the MLX engine, so they run anywhere; the CLI/daemon still need
-Apple Silicon at runtime. CI runs the same checks on macOS.
