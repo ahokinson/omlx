@@ -17,3 +17,12 @@ def human_size(n: int) -> str:
             return f"{x:.1f}{unit}"
         x /= 1024
     return f"{x:.1f}TB"
+
+
+def human_params(total: int) -> str:
+    """Format a parameter count as an Ollama-style tag (e.g. ``"21b"``, ``"700m"``)."""
+    if total >= 1_000_000_000:
+        return f"{round(total / 1e9)}b"
+    if total >= 1_000_000:
+        return f"{round(total / 1e6)}m"
+    return str(total)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -22,7 +23,7 @@ Row = dict[str, Any]
 
 @dataclass
 class ModelEntry:
-    name: str  # friendly name, e.g. "Llama-3.2-1B-Instruct-4bit"
+    name: str  # Ollama-style "base:paramtag", e.g. "gpt-oss:21b"
     repo_id: str  # HF repo id or local path used to load
     path: str  # resolved local snapshot / converted dir
     quant: str | None = None  # e.g. "4bit", "8bit", or None
@@ -48,9 +49,20 @@ def _save(data: dict[str, Row]) -> None:
     tmp.replace(settings.registry_path)
 
 
+# Trailing name tokens that a param tag or the `quant` field records instead:
+# size (20b, 3b), quant bits (4bit), float/int precision, and a bare mlx tag.
+_TAG_SUFFIX = re.compile(r"^(?:\d+(?:\.\d+)?[bm]|\d+bit|(?:bf|fp|f)16|int[48]|mxfp4|mlx)$")
+
+
 def name_for(repo_id: str) -> str:
-    """Derive a friendly name from a repo id (drop the org prefix)."""
-    return repo_id.split("/")[-1]
+    """Derive a base name from a repo id: drop the org prefix, lowercase, and
+    strip trailing size/quant/precision tokens. The param size becomes the
+    ``:tag`` built in pull; the quant is kept in ``ModelEntry.quant``.
+    """
+    parts = repo_id.split("/")[-1].lower().split("-")
+    while len(parts) > 1 and _TAG_SUFFIX.match(parts[-1]):
+        parts.pop()
+    return "-".join(parts)
 
 
 def _resolve_key(data: dict[str, Row], name: str) -> str | None:
@@ -63,7 +75,9 @@ def _resolve_key(data: dict[str, Row], name: str) -> str | None:
        handles ``get("Llama-…")`` directly.
     2. Friendly-tail match: drops the org prefix, so ``get("Llama-…")`` also
        resolves when the caller passes the full ``org/Llama-…`` id.
-    3. Full repo_id scan: finds an entry whose recorded ``repo_id`` equals
+    3. Tagless base match: an untagged base resolves to its sole tagged entry,
+       so ``get("gpt-oss")`` finds ``gpt-oss:21b`` (Ollama ``:latest`` style).
+    4. Full repo_id scan: finds an entry whose recorded ``repo_id`` equals
        ``name``, so ``get("org/Llama")`` works even when the friendly name
        differs from the repo's last path segment.
     """
@@ -72,6 +86,12 @@ def _resolve_key(data: dict[str, Row], name: str) -> str | None:
     friendly = name_for(name)
     if friendly in data:
         return friendly
+    for base in dict.fromkeys((name, friendly)):
+        if ":" in base:
+            continue
+        matches = [k for k in data if k.startswith(base + ":")]
+        if len(matches) == 1:
+            return matches[0]
     for key, row in data.items():
         if row.get("repo_id") == name:
             return key
@@ -94,15 +114,18 @@ def entries() -> list[ModelEntry]:
     return [ModelEntry(**row) for row in _load().values()]
 
 
-def remove(name: str) -> ModelEntry | None:
-    """Drop from the registry and purge the HF cache snapshot. Returns entry."""
+def remove(name: str, purge: bool = True) -> ModelEntry | None:
+    """Drop from the registry. Purges the HF cache snapshot unless ``purge`` is False.
+    Returns the entry, or None if not registered.
+    """
     data = _load()
     key = _resolve_key(data, name)
     if key is None:
         return None
     entry = ModelEntry(**data.pop(key))
     _save(data)
-    _purge_weights(entry)
+    if purge:
+        _purge_weights(entry)
     return entry
 
 

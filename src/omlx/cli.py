@@ -64,11 +64,14 @@ def pull(
     revision: str | None = typer.Option(None, help="Git revision / branch / tag."),
     convert: bool = typer.Option(False, "--convert", help="Quantize a non-MLX repo on-device."),
     bits: int = typer.Option(4, help="Quantization bits when converting."),
+    name: str | None = typer.Option(
+        None, "--name", help="Override the registered name (default: derived base:paramtag)."
+    ),
 ):
     """Download a model (Xet-accelerated) and register it."""
     from .pull import pull as do_pull
 
-    entry = do_pull(repo_id, revision=revision, convert=convert, bits=bits)
+    entry = do_pull(repo_id, revision=revision, convert=convert, bits=bits, name=name)
     typer.echo(
         f"pulled {entry.name}  ({human_size(entry.size_bytes)}, quant={entry.quant or 'none'})"
     )
@@ -89,9 +92,14 @@ def list_models():
 
 
 @app.command()
-def rm(name: str = typer.Argument(..., help="Model name (or repo id) to remove.")):
+def rm(
+    name: str = typer.Argument(..., help="Model name (or repo id) to remove."),
+    keep_cache: bool = typer.Option(
+        False, "--keep-cache", help="Keep the downloaded weights in the HF cache."
+    ),
+):
     """Remove a model from the registry and purge its cache snapshot."""
-    entry = registry.remove(name)
+    entry = registry.remove(name, purge=not keep_cache)
     if entry is None:
         typer.echo(f"no such model: {name}")
         raise typer.Exit(1)

@@ -59,6 +59,19 @@ def test_rm_unknown_model_exits_1(runner):
     assert "no such model" in result.stdout
 
 
+def test_rm_keep_cache_passes_purge_false(runner, monkeypatch, make_entry):
+    seen = {}
+
+    def fake_remove(name, purge=True):
+        seen["purge"] = purge
+        return make_entry(name=name)
+
+    monkeypatch.setattr(registry, "remove", fake_remove)
+    result = runner.invoke(app, ["rm", "Llama", "--keep-cache"])
+    assert result.exit_code == 0
+    assert seen["purge"] is False
+
+
 def test_run_one_shot_streams_reply(runner, monkeypatch):
     monkeypatch.setattr("omlx.daemon.ensure_running", lambda: None)
     monkeypatch.setattr(

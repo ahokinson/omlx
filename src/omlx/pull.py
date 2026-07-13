@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
+from ._fmt import human_params
 from .config import ensure_dirs, settings
 from .registry import ModelEntry, add, name_for
 
@@ -41,11 +43,47 @@ def _detect_quant(config_path: Path) -> str | None:
     return None
 
 
-def _list_repo_files(repo_id: str, revision: str | None) -> list[str]:
+# Weight + tokenizer + config patterns fetched from a repo. *.bin covers repos
+# that ship only PyTorch weights (read by mlx_lm.convert on the convert path).
+_ALLOW_PATTERNS = ["*.safetensors", "*.bin", "*.json", "*.txt", "*.model", "tokenizer*", "*.py"]
+
+
+def _cached_snapshot(repo_id: str, revision: str | None) -> Path | None:
+    """Return the snapshot path if the repo is already fully in the HF cache, else None."""
+    from huggingface_hub import snapshot_download
+
+    try:
+        return Path(
+            snapshot_download(
+                repo_id,
+                revision=revision,
+                allow_patterns=_ALLOW_PATTERNS,
+                local_files_only=True,
+            )
+        )
+    except FileNotFoundError:
+        # LocalEntryNotFoundError (a FileNotFoundError) when not fully cached.
+        return None
+
+
+def _repo_meta(repo_id: str, revision: str | None):
+    """Return ``(filenames, safetensors)`` from the HF ``model_info``.
+
+    ``safetensors`` is a ``SafeTensorsInfo`` (``.total`` is the param count) or
+    ``None`` when the Hub hasn't computed it for the repo.
+    """
     from huggingface_hub import HfApi
 
-    info = HfApi().model_info(repo_id, revision=revision, files_metadata=False)
-    return [s.rfilename for s in (info.siblings or [])]
+    info = HfApi().model_info(repo_id, revision=revision, expand=["siblings", "safetensors"])
+    return [s.rfilename for s in (info.siblings or [])], info.safetensors
+
+
+def _tagged_name(repo_id: str, safetensors: Any) -> str:
+    """Build the Ollama-style ``base:paramtag`` name, or bare base if params are unknown."""
+    base = name_for(repo_id)
+    if safetensors is not None:
+        return f"{base}:{human_params(safetensors.total)}"
+    return base
 
 
 def pull(
@@ -53,43 +91,30 @@ def pull(
     revision: str | None = None,
     convert: bool = False,
     bits: int = 4,
+    name: str | None = None,
 ) -> ModelEntry:
     """Download `repo_id` and add it to the registry. Returns the entry."""
     from huggingface_hub import snapshot_download
 
     ensure_dirs()
-    files = _list_repo_files(repo_id, revision)
+    files, safetensors = _repo_meta(repo_id, revision)
     has_safetensors = any(f.endswith(".safetensors") for f in files)
     has_config = "config.json" in files
 
     if not has_config:
         raise ValueError(f"{repo_id!r} has no config.json; not a loadable model repo")
 
-    # hf_xet (installed via huggingface_hub[hf_xet]) makes this Xet-accelerated
-    # automatically for Xet-backed repos; progress bars are built in.
-    snapshot = Path(
-        snapshot_download(
-            repo_id,
-            revision=revision,
-            allow_patterns=[
-                "*.safetensors",
-                # PyTorch weights: needed for the convert path on repos that
-                # ship no safetensors (mlx_lm.convert reads them from the snapshot).
-                "*.bin",
-                "*.json",
-                "*.txt",
-                "*.model",
-                "tokenizer*",
-                "*.py",
-            ],
-        )
+    # Reuse the cached snapshot when the weights are already present; only hit the
+    # network (hf_xet Xet-accelerated for Xet-backed repos) on a cache miss.
+    snapshot = _cached_snapshot(repo_id, revision) or Path(
+        snapshot_download(repo_id, revision=revision, allow_patterns=_ALLOW_PATTERNS)
     )
 
     if convert or not has_safetensors:
-        entry = _convert(repo_id, snapshot, bits)
+        entry = _convert(repo_id, snapshot, bits, name=name)
     else:
         entry = ModelEntry(
-            name=name_for(repo_id),
+            name=name or _tagged_name(repo_id, safetensors),
             repo_id=repo_id,
             path=str(snapshot),
             quant=_detect_quant(snapshot / "config.json"),
@@ -101,11 +126,11 @@ def pull(
     return entry
 
 
-def _convert(repo_id: str, snapshot: Path, bits: int) -> ModelEntry:
+def _convert(repo_id: str, snapshot: Path, bits: int, name: str | None = None) -> ModelEntry:
     """Quantize a non-MLX repo on-device into ~/.omlx/converted/<name>."""
     from mlx_lm.convert import convert as mlx_convert
 
-    name = name_for(repo_id) + f"-{bits}bit-mlx"
+    name = name or (name_for(repo_id) + f"-{bits}bit-mlx")
     out = settings.converted_dir / name
     mlx_convert(
         str(snapshot),
