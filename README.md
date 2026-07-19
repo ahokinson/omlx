@@ -121,6 +121,15 @@ channel) and control tokens are stripped:
 - A prior turn's `reasoning_content` sent back in `messages` is dropped before
   templating.
 
+**Output budget.** Reasoning tokens count against the output cap. With no
+client budget set, gpt-oss can spend the whole default in `analysis` and never
+reach the `final` channel — the model "thinks but doesn't answer". Set an
+output budget: `max_completion_tokens` (the OpenAI reasoning-model field,
+honored in preference to `max_tokens`), or `max_tokens`; for opencode, set
+`limit.output` on the model entry (e.g. 32768). The default chat-cap is sized
+for agentic replies, but reasoning effort can still exceed it — set it
+explicitly for reasoning models.
+
 ## Tool calling
 
 `/v1/chat/completions` supports OpenAI **function calling**, so agentic clients

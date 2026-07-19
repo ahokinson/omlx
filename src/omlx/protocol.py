@@ -126,8 +126,15 @@ class _SamplingRequest(BaseModel):
     model: str
     # Default sized for agentic clients (opencode): a small cap truncates
     # replies and tool-call bodies mid-JSON, which reads to the client as a
-    # failed tool call. A request-supplied `max_tokens` still overrides.
-    max_tokens: int = 4096
+    # failed tool call. A request-supplied `max_tokens` (or
+    # `max_completion_tokens`) still overrides.
+    max_tokens: int = 8192
+    # OpenAI's reasoning-model output cap field. Honored when present and takes
+    # precedence over `max_tokens`, since reasoning clients (and the OpenAI
+    # spec for o-series / gpt-oss) send this rather than `max_tokens`. Without
+    # it, reasoning effort spends the whole budget in the analysis channel and
+    # `final` never fires — the model "thinks but never answers".
+    max_completion_tokens: int | None = None
     temperature: float = 0.7
     top_p: float = 1.0
     top_k: int = 0
@@ -145,7 +152,9 @@ class _SamplingRequest(BaseModel):
 
     def sampling(self) -> SamplingParams:
         return SamplingParams(
-            max_tokens=self.max_tokens,
+            max_tokens=self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens,
             temperature=self.temperature,
             top_p=self.top_p,
             top_k=self.top_k,

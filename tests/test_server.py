@@ -313,6 +313,57 @@ def test_chat_stream_omits_reasoning_when_absent(client):
     assert all("reasoning_content" not in f["choices"][0]["delta"] for f in frames if f["choices"])
 
 
+def test_chat_honors_max_completion_tokens(client):
+    """The OpenAI reasoning-model output-cap field reaches SamplingParams."""
+    from omlx.protocol import ChatRequest
+
+    req = ChatRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        max_completion_tokens=12345,
+    )
+    assert req.sampling().max_tokens == 12345
+
+
+def test_chat_max_completion_tokens_overrides_max_tokens(client):
+    """When both are sent, the reasoning-model field wins (OpenAI spec for o-series)."""
+    from omlx.protocol import ChatRequest
+
+    req = ChatRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=4096,
+        max_completion_tokens=16384,
+    )
+    assert req.sampling().max_tokens == 16384
+
+
+def test_chat_reasoning_exhausts_budget_reports_length(make_client):
+    """An analysis-only stream hitting the cap keeps content empty and reports length.
+
+    Mirrors the gpt-oss failure mode: the model spends the whole output budget in
+    the `analysis` channel (reasoning) and never reaches `final`, so `content`
+    is empty and the terminal finish is "length", not "stop".
+    """
+    client = make_client(chunks=("",), reasonings=("pondering",), finish_reason="length")
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    msg = r.json()["choices"][0]["message"]
+    assert msg["content"] == ""
+    assert msg["reasoning_content"] == "pondering"
+    assert r.json()["choices"][0]["finish_reason"] == "length"
+
+
+def test_chat_default_cap_is_reasoning_friendly():
+    """The default chat max_tokens is large enough for reasoning effort headroom."""
+    from omlx.protocol import ChatRequest
+
+    req = ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}])
+    assert req.sampling().max_tokens >= 8192
+
+
 def test_chat_drops_inbound_reasoning_before_templating(make_client):
     """A client echoing a prior turn's reasoning must not leak it into the prompt."""
     client = make_client()
