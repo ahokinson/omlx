@@ -1,9 +1,10 @@
-"""OpenAI-compatible envelope helpers and request/response value objects.
+"""Wire-shape envelope helpers and request/response value objects.
 
-Framework-agnostic: knows the OpenAI wire shapes (chat and text-completion,
-streamed and non-streamed) but nothing about FastAPI or MLX. ``server.py``
-wires these into ASGI routes; ``engine.py`` re-exports ``SamplingParams`` and
-``Completion`` so older call sites can keep importing from either location.
+Framework-agnostic: knows the OpenAI wire shapes (chat and text-completion, SSE)
+and the Ollama native shapes (`/api/chat`, `/api/generate`, NDJSON), streamed and
+non-streamed, but nothing about FastAPI or MLX. ``server.py`` wires these into
+ASGI routes; ``engine.py`` re-exports ``SamplingParams`` and ``Completion`` so
+older call sites can keep importing from either location.
 """
 
 from __future__ import annotations
@@ -13,10 +14,11 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class ContentPart(BaseModel):
@@ -101,13 +103,42 @@ def _normalize_stop(stop: str | list[str] | None) -> tuple[str, ...]:
     return tuple(s for s in seqs if s)
 
 
+def _int_keyed(bias: dict[str, float] | None) -> dict[int, float] | None:
+    """Coerce an OpenAI `logit_bias` (token-id string keys) to int keys.
+
+    Non-integer keys are dropped; an empty or all-invalid map becomes None so
+    the engine skips building a logit-bias processor.
+    """
+    if not bias:
+        return None
+    out: dict[int, float] = {}
+    for key, value in bias.items():
+        try:
+            out[int(key)] = value
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
+
 class _SamplingRequest(BaseModel):
     """Fields shared by the chat and text completion request bodies."""
 
     model: str
-    max_tokens: int = 512
+    # Default sized for agentic clients (opencode): a small cap truncates
+    # replies and tool-call bodies mid-JSON, which reads to the client as a
+    # failed tool call. A request-supplied `max_tokens` still overrides.
+    max_tokens: int = 4096
     temperature: float = 0.7
     top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    # OpenAI additive penalties (range [-2, 2]); 0.0 is a no-op.
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    # Not an OpenAI field; a multiplicative repeat penalty accepted as an extra.
+    repetition_penalty: float | None = None
+    # OpenAI logit bias: token-id string -> additive bias.
+    logit_bias: dict[str, float] | None = None
     stop: str | list[str] | None = None
     seed: int | None = None
     stream: bool = False
@@ -117,6 +148,12 @@ class _SamplingRequest(BaseModel):
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
+            frequency_penalty=self.frequency_penalty,
+            presence_penalty=self.presence_penalty,
+            repetition_penalty=self.repetition_penalty,
+            logit_bias=_int_keyed(self.logit_bias),
             stop=_normalize_stop(self.stop),
             seed=self.seed,
         )
@@ -139,6 +176,12 @@ class SamplingParams:
     max_tokens: int = 512
     temperature: float = 0.7
     top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float | None = None
+    logit_bias: dict[int, float] | None = None
     stop: tuple[str, ...] = ()
     seed: int | None = None
 
@@ -361,3 +404,284 @@ def json_response(
         "choices": choices,
         "usage": usage(usage_completion),
     }
+
+
+# --- Ollama native API (`/api/chat`, `/api/generate`) -----------------------
+#
+# The Ollama wire form differs from OpenAI: NDJSON streaming (one JSON object
+# per line, no `data:` prefix and no `[DONE]` sentinel), `stream` defaults to
+# true, sampling lives under `options`, reasoning rides a `thinking` field, and
+# tool-call `arguments` is a JSON object rather than an OpenAI JSON string.
+
+_NDJSON_MEDIA_TYPE = "application/x-ndjson"
+
+
+class OllamaOptions(BaseModel):
+    """Ollama `options` block: sampling knobs under Ollama's field names.
+
+    All optional; unset fields fall back to the `SamplingParams` defaults via
+    `to_sampling`. `num_predict` is Ollama's `max_tokens`; `repeat_penalty` is
+    the multiplicative `repetition_penalty`.
+    """
+
+    num_predict: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    repeat_penalty: float | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    stop: str | list[str] | None = None
+    seed: int | None = None
+
+    def to_sampling(self, default_max_tokens: int) -> SamplingParams:
+        """Map onto `SamplingParams`, using `default_max_tokens` when unset.
+
+        A negative `num_predict` (Ollama's "infinite" / "fill context" sentinels)
+        is treated as unset and falls back to `default_max_tokens`.
+        """
+        base = SamplingParams()
+        max_tokens = default_max_tokens
+        if self.num_predict is not None and self.num_predict >= 0:
+            max_tokens = self.num_predict
+        return SamplingParams(
+            max_tokens=max_tokens,
+            temperature=base.temperature if self.temperature is None else self.temperature,
+            top_p=base.top_p if self.top_p is None else self.top_p,
+            top_k=base.top_k if self.top_k is None else self.top_k,
+            min_p=base.min_p if self.min_p is None else self.min_p,
+            frequency_penalty=(
+                base.frequency_penalty if self.frequency_penalty is None else self.frequency_penalty
+            ),
+            presence_penalty=(
+                base.presence_penalty if self.presence_penalty is None else self.presence_penalty
+            ),
+            repetition_penalty=self.repeat_penalty,
+            stop=_normalize_stop(self.stop),
+            seed=self.seed,
+        )
+
+
+class OllamaChatRequest(BaseModel):
+    """Body for Ollama `/api/chat`.
+
+    Reuses the OpenAI `ChatMessage` (content parts, null content, `tool_calls`,
+    `role: "tool"` all templated the same way). `keep_alive` and `format` are
+    accepted for wire compatibility but ignored. `stream` defaults to true, per
+    Ollama.
+    """
+
+    model: str
+    messages: list[ChatMessage] = []
+    tools: list[dict[str, Any]] | None = None
+    stream: bool = True
+    think: bool | None = None
+    options: OllamaOptions = OllamaOptions()
+    keep_alive: str | int | None = None
+    format: str | dict[str, Any] | None = None
+
+
+class OllamaGenerateRequest(BaseModel):
+    """Body for Ollama `/api/generate`.
+
+    `prompt` is templated through the model's chat template by default (Ollama
+    parity); `raw` streams the bare prompt with no template. `system` is folded
+    in as a leading system message. `keep_alive`, `format`, `context`, `images`,
+    `suffix`, and `template` are accepted but ignored.
+    """
+
+    model: str
+    prompt: str = ""
+    system: str | None = None
+    raw: bool = False
+    stream: bool = True
+    think: bool | None = None
+    options: OllamaOptions = OllamaOptions()
+    keep_alive: str | int | None = None
+    format: str | dict[str, Any] | None = None
+
+
+class OllamaPullRequest(BaseModel):
+    """Body for Ollama `/api/pull`; `name` is the legacy alias for `model`."""
+
+    model: str = Field(validation_alias=AliasChoices("model", "name"))
+    stream: bool = True
+    insecure: bool = False
+
+
+def _now_iso() -> str:
+    """Current UTC instant as an ISO-8601 string for Ollama `created_at`."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ndjson(payload: dict[str, Any]) -> str:
+    return f"{json.dumps(payload)}\n"
+
+
+def _ollama_stats(final: Completion | None, started_ns: int) -> dict[str, int]:
+    """Terminal timing/count stats for an Ollama `done: true` frame.
+
+    Token counts are exact (from the terminal `Completion`); durations are
+    best-effort — only the wall-clock total is measured, so `load_duration` and
+    `prompt_eval_duration` are 0 and `eval_duration` carries the whole span.
+    All durations are nanoseconds, per Ollama.
+    """
+    total = time.perf_counter_ns() - started_ns
+    prompt_tokens = final.prompt_tokens if final else 0
+    completion_tokens = final.completion_tokens if final else 0
+    return {
+        "total_duration": total,
+        "load_duration": 0,
+        "prompt_eval_count": prompt_tokens,
+        "prompt_eval_duration": 0,
+        "eval_count": completion_tokens,
+        "eval_duration": total,
+    }
+
+
+def _ollama_tool_calls(tool_calls: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+    """OpenAI-shaped tool calls -> Ollama `{"function": {name, arguments}}`.
+
+    Ollama carries `arguments` as an object (not the OpenAI JSON string), so the
+    calls are decoded with `_decode_tool_call_args`; the streaming `index` and
+    the OpenAI `id`/`type` fields are dropped.
+    """
+    out: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        func = _decode_tool_call_args(tc).get("function", {})
+        out.append(
+            {"function": {"name": func.get("name", ""), "arguments": func.get("arguments", {})}}
+        )
+    return out
+
+
+def _ollama_done_reason(finish: str | None) -> str:
+    """Map an OpenAI finish reason to an Ollama `done_reason` (default "stop")."""
+    return finish or "stop"
+
+
+def ollama_chat_response(
+    chunks: Iterator[Completion], *, model: str, think: bool
+) -> StreamingResponse:
+    """Stream `chunks` as Ollama `/api/chat` NDJSON frames.
+
+    Each token frame carries an incremental `message` with `done: false`;
+    `thinking` rides the message only when `think` is set and reasoning is
+    non-empty, and `tool_calls` only when present. The terminal frame has an
+    empty message, `done: true`, a `done_reason`, and timing/count stats.
+    A generator error is surfaced in-band as a trailing `{"error": ...}` line,
+    since a started 200 stream can't switch to an error status.
+    """
+
+    def gen() -> Iterator[str]:
+        started = time.perf_counter_ns()
+        try:
+            final: Completion | None = None
+            for chunk in chunks:
+                message: dict[str, Any] = {"role": "assistant", "content": chunk.text}
+                if think and chunk.reasoning:
+                    message["thinking"] = chunk.reasoning
+                if chunk.tool_calls:
+                    message["tool_calls"] = _ollama_tool_calls(chunk.tool_calls)
+                if chunk.text or (think and chunk.reasoning) or chunk.tool_calls:
+                    yield _ndjson(
+                        {
+                            "model": model,
+                            "created_at": _now_iso(),
+                            "message": message,
+                            "done": False,
+                        }
+                    )
+                if chunk.finish_reason is not None:
+                    final = chunk
+            yield _ndjson(
+                {
+                    "model": model,
+                    "created_at": _now_iso(),
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                    "done_reason": _ollama_done_reason(final.finish_reason if final else None),
+                    **_ollama_stats(final, started),
+                }
+            )
+        except Exception as e:
+            yield _ndjson({"error": str(e)})
+
+    return StreamingResponse(gen(), media_type=_NDJSON_MEDIA_TYPE)
+
+
+def ollama_chat_collect(chunks: Iterator[Completion], *, model: str, think: bool) -> dict[str, Any]:
+    """Drain `chunks` into a single non-streaming Ollama `/api/chat` object."""
+    started = time.perf_counter_ns()
+    content, reasoning, tool_calls, final = collect(chunks)
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if think and reasoning:
+        message["thinking"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = _ollama_tool_calls(tool_calls)
+    return {
+        "model": model,
+        "created_at": _now_iso(),
+        "message": message,
+        "done": True,
+        "done_reason": _ollama_done_reason(final.finish_reason if final else None),
+        **_ollama_stats(final, started),
+    }
+
+
+def ollama_generate_response(
+    chunks: Iterator[Completion], *, model: str, think: bool
+) -> StreamingResponse:
+    """Stream `chunks` as Ollama `/api/generate` NDJSON frames (flat `response`)."""
+
+    def gen() -> Iterator[str]:
+        started = time.perf_counter_ns()
+        try:
+            final: Completion | None = None
+            for chunk in chunks:
+                frame: dict[str, Any] = {
+                    "model": model,
+                    "created_at": _now_iso(),
+                    "response": chunk.text,
+                    "done": False,
+                }
+                if think and chunk.reasoning:
+                    frame["thinking"] = chunk.reasoning
+                if chunk.text or (think and chunk.reasoning):
+                    yield _ndjson(frame)
+                if chunk.finish_reason is not None:
+                    final = chunk
+            yield _ndjson(
+                {
+                    "model": model,
+                    "created_at": _now_iso(),
+                    "response": "",
+                    "done": True,
+                    "done_reason": _ollama_done_reason(final.finish_reason if final else None),
+                    **_ollama_stats(final, started),
+                }
+            )
+        except Exception as e:
+            yield _ndjson({"error": str(e)})
+
+    return StreamingResponse(gen(), media_type=_NDJSON_MEDIA_TYPE)
+
+
+def ollama_generate_collect(
+    chunks: Iterator[Completion], *, model: str, think: bool
+) -> dict[str, Any]:
+    """Drain `chunks` into a single non-streaming Ollama `/api/generate` object."""
+    started = time.perf_counter_ns()
+    content, reasoning, _tool_calls, final = collect(chunks)
+    out: dict[str, Any] = {
+        "model": model,
+        "created_at": _now_iso(),
+        "response": content,
+        "done": True,
+        "done_reason": _ollama_done_reason(final.finish_reason if final else None),
+        **_ollama_stats(final, started),
+    }
+    if think and reasoning:
+        out["thinking"] = reasoning
+    return out

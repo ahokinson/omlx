@@ -1,10 +1,12 @@
 """HTTP server backed by mlx-lm.
 
 Serves the OpenAI surface (`/v1/models`, `/v1/chat/completions`,
-`/v1/completions`, SSE `data:` framing) plus the Ollama read/admin routes
-`/api/ps`, `/api/version`, `/api/tags`, `/api/show`, and `/api/delete`.
-The wire shapes live in :mod:`omlx.protocol`; this module is the FastAPI layer
-wiring them to the model manager and registry.
+`/v1/completions`, SSE `data:` framing) alongside the Ollama native surface:
+generation via `/api/chat` and `/api/generate` (NDJSON framing), `/api/pull`,
+the `GET /` liveness probe, and the read/admin routes `/api/ps`, `/api/version`,
+`/api/tags`, `/api/show`, and `/api/delete`. The wire shapes live in
+:mod:`omlx.protocol`; this module is the FastAPI layer wiring them to the model
+manager and registry.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from . import __version__, registry
 from .engine import MANAGER, Completion
@@ -27,12 +29,19 @@ from .protocol import (
     ChatRequest,
     CompletionRequest,
     ModelRef,
+    OllamaChatRequest,
+    OllamaGenerateRequest,
+    OllamaPullRequest,
     Shape,
     _now,
     _rid,
     _SamplingRequest,
     collect,
     json_response,
+    ollama_chat_collect,
+    ollama_chat_response,
+    ollama_generate_collect,
+    ollama_generate_response,
     sse_response,
 )
 
@@ -75,6 +84,12 @@ def _complete(
         choices=[shape.terminal_choice(content, finish, reasoning, tool_calls)],
         usage_completion=final,
     )
+
+
+@app.get("/", response_class=PlainTextResponse)
+def root() -> str:
+    """Ollama root liveness probe; clients expect the literal `Ollama is running`."""
+    return "Ollama is running"
 
 
 @app.get("/health")
@@ -221,3 +236,83 @@ def completions(req: CompletionRequest) -> StreamingResponse | dict[str, Any]:
         COMPLETION_SHAPE,
         lambda: MANAGER.stream_text(req.model, req.prompt, req.sampling()),
     )
+
+
+# Default max_tokens for the Ollama routes, matching `_SamplingRequest.max_tokens`
+# (Ollama's own default is unbounded, but a cap avoids truncating agentic replies
+# mid-JSON — see `protocol._SamplingRequest`).
+_OLLAMA_DEFAULT_MAX_TOKENS = 4096
+
+
+@app.post("/api/chat", response_model=None)
+def api_chat(req: OllamaChatRequest) -> StreamingResponse | dict[str, Any]:
+    """Ollama `/api/chat`; streams NDJSON when `stream` (default true), else JSON.
+
+    Reasoning rides `message.thinking`: emitted when the request sets `think`, or
+    (when `think` is unset) whenever the model produces reasoning at all.
+    """
+    messages = [m.to_template_dict() for m in req.messages]
+    think = True if req.think is None else req.think
+    params = req.options.to_sampling(_OLLAMA_DEFAULT_MAX_TOKENS)
+    chunks = MANAGER.stream_chat(req.model, messages, params, tools=req.tools)
+    if req.stream:
+        return ollama_chat_response(chunks, model=req.model, think=think)
+    try:
+        return ollama_chat_collect(chunks, model=req.model, think=think)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/generate", response_model=None)
+def api_generate(req: OllamaGenerateRequest) -> StreamingResponse | dict[str, Any]:
+    """Ollama `/api/generate`; streams NDJSON when `stream` (default true), else JSON.
+
+    The prompt is templated through the model's chat template by default (Ollama
+    parity), optionally with a leading `system` message; `raw` streams the bare
+    prompt with no template.
+    """
+    think = True if req.think is None else req.think
+    params = req.options.to_sampling(_OLLAMA_DEFAULT_MAX_TOKENS)
+    if req.raw:
+        chunks = MANAGER.stream_text(req.model, req.prompt, params)
+    else:
+        messages: list[dict[str, Any]] = []
+        if req.system:
+            messages.append({"role": "system", "content": req.system})
+        messages.append({"role": "user", "content": req.prompt})
+        chunks = MANAGER.stream_chat(req.model, messages, params)
+    if req.stream:
+        return ollama_generate_response(chunks, model=req.model, think=think)
+    try:
+        return ollama_generate_collect(chunks, model=req.model, think=think)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/pull", response_model=None)
+def api_pull(req: OllamaPullRequest) -> StreamingResponse | dict[str, str]:
+    """Ollama `/api/pull`; downloads and registers a model.
+
+    The Hugging Face download is blocking, so streamed progress is coarse — a
+    `pulling` frame then `success` — rather than the per-byte layered progress
+    Ollama emits. Non-stream returns `{"status": "success"}`, HTTP 500 on failure.
+    """
+    from .pull import pull
+
+    if req.stream:
+
+        def gen() -> Iterator[str]:
+            yield json.dumps({"status": f"pulling {req.model}"}) + "\n"
+            try:
+                pull(req.model)
+            except Exception as e:
+                yield json.dumps({"error": str(e)}) + "\n"
+                return
+            yield json.dumps({"status": "success"}) + "\n"
+
+        return StreamingResponse(gen(), media_type="application/x-ndjson")
+    try:
+        pull(req.model)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"status": "success"}

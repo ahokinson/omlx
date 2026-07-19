@@ -10,7 +10,46 @@ from omlx import engine, registry
 from omlx.engine import Completion, ModelManager, SamplingParams
 
 
-class FakeTokenizer:
+class _EncTokenizer:
+    """Base tokenizer fake: char-code encoding + BOS heuristic for the cache path."""
+
+    bos_token = None
+
+    def encode(self, text, add_special_tokens=True):
+        return [ord(c) for c in text]
+
+
+class FakeCache:
+    """Minimal trimmable KV cache: tracks a token `offset` like the real caches."""
+
+    def __init__(self):
+        self.offset = 0
+
+    def is_trimmable(self):
+        return True
+
+
+def _fake_cache_module():
+    """A stand-in `mlx_lm.models.cache` with the three helpers the engine calls."""
+    mod = types.ModuleType("mlx_lm.models.cache")
+    mod.make_prompt_cache = lambda model, *a, **k: [FakeCache()]
+    mod.can_trim_prompt_cache = lambda cache: all(c.is_trimmable() for c in cache)
+
+    def trim(cache, n):
+        for c in cache:
+            c.offset = max(0, c.offset - n)
+        return n
+
+    mod.trim_prompt_cache = trim
+    return mod
+
+
+def _plen(prompt):
+    """Token count of a prefill input (a token list or a raw string)."""
+    return len(prompt)
+
+
+class FakeTokenizer(_EncTokenizer):
     def apply_chat_template(self, messages, add_generation_prompt, tokenize):
         return "PROMPT:" + messages[-1]["content"]
 
@@ -30,28 +69,43 @@ def fake_mlx(monkeypatch):
         calls["active_mem"] += 512 * 1024 * 1024
         return object(), FakeTokenizer()
 
-    def stream_generate(model, tokenizer, prompt, max_tokens, sampler):
-        yield types.SimpleNamespace(
-            text="a", finish_reason=None, prompt_tokens=3, generation_tokens=1
-        )
-        yield types.SimpleNamespace(
-            text="b", finish_reason="stop", prompt_tokens=3, generation_tokens=2
-        )
+    def stream_generate(model, tokenizer, prompt, max_tokens, **kwargs):
+        # Record the prefilled token count and advance the (optional) cache the
+        # way real generation would: prompt tokens, then one per generated token.
+        calls["last_prompt_len"] = _plen(prompt)
+        cache = kwargs.get("prompt_cache")
+        if cache is not None:
+            cache[0].offset += _plen(prompt)
+        for i, (text, finish) in enumerate((("a", None), ("b", "stop"))):
+            if cache is not None:
+                cache[0].offset += 1
+            yield types.SimpleNamespace(
+                text=text,
+                finish_reason=finish,
+                prompt_tokens=_plen(prompt),
+                generation_tokens=i + 1,
+            )
 
     mlx_lm = types.ModuleType("mlx_lm")
     mlx_lm.load = load
     mlx_lm.stream_generate = stream_generate
     sample_utils = types.ModuleType("mlx_lm.sample_utils")
     sample_utils.make_sampler = lambda **k: object()
+    sample_utils.make_logits_processors = lambda **k: []
+    models = types.ModuleType("mlx_lm.models")
+    cache_mod = _fake_cache_module()
     mx = types.ModuleType("mlx.core")
     mx.clear_cache = lambda: None
     mx.get_active_memory = lambda: calls["active_mem"]
     mx.random = types.SimpleNamespace(seed=lambda s: calls.__setitem__("seed", s))
+    mx.array = lambda x: list(x)
     mlx = types.ModuleType("mlx")
     mlx.core = mx
 
     monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
     monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", sample_utils)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", cache_mod)
     monkeypatch.setitem(sys.modules, "mlx", mlx)
     monkeypatch.setitem(sys.modules, "mlx.core", mx)
     return calls
@@ -144,7 +198,8 @@ def test_stream_chat_yields_completions(fake_mlx, make_entry):
     )
     assert "".join(c.text for c in out) == "ab"
     assert out[-1].finish_reason == "stop"
-    assert out[-1].prompt_tokens == 3
+    # "PROMPT:hi" encodes to one token per char; first turn reuses nothing.
+    assert out[-1].prompt_tokens == len("PROMPT:hi")
     assert out[-1].completion_tokens == 2
 
 
@@ -156,10 +211,181 @@ def test_stream_text_yields_completions(fake_mlx, make_entry):
     assert out[-1].finish_reason == "stop"
 
 
+def test_generation_kwargs_forwards_sampling(fake_mlx, monkeypatch):
+    """Every sampling field reaches make_sampler / make_logits_processors."""
+    seen: dict[str, dict] = {}
+
+    def fake_sampler(**k):
+        seen["sampler"] = k
+        return "SAMPLER"
+
+    def fake_processors(**k):
+        seen["proc"] = k
+        return ["PROC"]
+
+    su = sys.modules["mlx_lm.sample_utils"]
+    monkeypatch.setattr(su, "make_sampler", fake_sampler)
+    monkeypatch.setattr(su, "make_logits_processors", fake_processors)
+    params = SamplingParams(
+        temperature=0.5,
+        top_p=0.9,
+        top_k=40,
+        min_p=0.05,
+        frequency_penalty=0.3,
+        presence_penalty=0.2,
+        repetition_penalty=1.1,
+        logit_bias={123: -5.0},
+    )
+    kw = engine._generation_kwargs(params)
+    assert seen["sampler"] == {"temp": 0.5, "top_p": 0.9, "min_p": 0.05, "top_k": 40}
+    assert seen["proc"] == {
+        "logit_bias": {123: -5.0},
+        "repetition_penalty": 1.1,
+        "presence_penalty": 0.2,
+        "frequency_penalty": 0.3,
+    }
+    assert kw["sampler"] == "SAMPLER" and kw["logits_processors"] == ["PROC"]
+    assert "kv_bits" not in kw
+
+
+def test_generation_kwargs_no_penalties_gives_none(fake_mlx):
+    """With default penalties the processor list collapses to None (no overhead)."""
+    assert engine._generation_kwargs(SamplingParams())["logits_processors"] is None
+
+
+def test_generation_kwargs_kv_quant(fake_mlx, monkeypatch):
+    """`OMLX_KV_BITS` and friends ride into stream_generate only when set."""
+    from omlx.config import settings
+
+    monkeypatch.setattr(settings, "kv_bits", 4)
+    monkeypatch.setattr(settings, "kv_group_size", 32)
+    monkeypatch.setattr(settings, "quantized_kv_start", 100)
+    kw = engine._generation_kwargs(SamplingParams())
+    assert kw["kv_bits"] == 4 and kw["kv_group_size"] == 32 and kw["quantized_kv_start"] == 100
+
+
+def test_prompt_cache_reuses_prefix(fake_mlx, make_entry):
+    """A second turn sharing a prefix prefills only the diverging suffix."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False)
+    p = SamplingParams(max_tokens=8)
+    list(mgr.stream_chat("A", [{"role": "user", "content": "hi"}], p))
+    assert fake_mlx["last_prompt_len"] == len("PROMPT:hi")  # full prefill, nothing cached yet
+    out = list(mgr.stream_chat("A", [{"role": "user", "content": "hi there"}], p))
+    # Only " there" (the divergence from "PROMPT:hi") is prefilled the second turn.
+    assert fake_mlx["last_prompt_len"] == len("PROMPT:hi there") - len("PROMPT:hi")
+    # Reused prefix is added back, so usage still reports the whole prompt.
+    assert out[-1].prompt_tokens == len("PROMPT:hi there")
+    lm = mgr.get("A")
+    assert lm.cache_tokens == [ord(c) for c in "PROMPT:hi there"]
+    assert lm.cache[0].offset == len(lm.cache_tokens)  # invariant: cache holds the prompt
+
+
+def test_prompt_cache_disabled_prefills_full(fake_mlx, make_entry, monkeypatch):
+    """With OMLX_PROMPT_CACHE off, no cache is built and the full prompt is prefilled."""
+    from omlx.config import settings
+
+    monkeypatch.setattr(settings, "prompt_cache", False)
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False)
+    list(mgr.stream_chat("A", [{"role": "user", "content": "hi"}], SamplingParams(max_tokens=8)))
+    lm = mgr.get("A")
+    assert lm.cache is None and lm.cache_tokens == []
+
+
+def test_prompt_cache_concurrent_falls_back(fake_mlx, make_entry):
+    """When the cache lock is held (a concurrent generation), the turn skips reuse."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False)
+    lm = mgr.get("A")
+    lm.cache_lock.acquire()
+    try:
+        list(
+            mgr.stream_chat("A", [{"role": "user", "content": "hi"}], SamplingParams(max_tokens=8))
+        )
+    finally:
+        lm.cache_lock.release()
+    assert lm.cache is None and lm.cache_tokens == []
+    assert fake_mlx["last_prompt_len"] == len("PROMPT:hi")
+
+
+def test_with_offset_adds_only_on_terminal():
+    """`_with_offset` bumps the prompt count on the terminal completion only."""
+    mid = Completion(text="x")
+    assert engine._with_offset(mid, 5) is mid  # no finish_reason -> untouched
+    terminal = Completion(text="", finish_reason="stop", prompt_tokens=2)
+    assert engine._with_offset(terminal, 5).prompt_tokens == 7
+    assert engine._with_offset(terminal, 0) is terminal  # zero offset -> untouched
+
+
+def test_lcp():
+    assert engine._lcp([1, 2, 3], [1, 2, 9, 4]) == 2  # diverge mid-sequence
+    assert engine._lcp([1, 2], [1, 2, 3]) == 2  # one extends the other
+    assert engine._lcp([], [1]) == 0
+
+
+def test_prompt_cache_skips_tiny_prompt(fake_mlx, make_entry, monkeypatch):
+    """A prompt too short to be worth caching takes the plain string path."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False)
+    lm = mgr.get("A")
+    monkeypatch.setattr(lm.tokenizer, "apply_chat_template", lambda *a, **k: "x")
+    list(mgr.stream_chat("A", [{"role": "user", "content": "hi"}], SamplingParams(max_tokens=8)))
+    assert lm.cache is None and lm.cache_tokens == []
+    assert fake_mlx["last_prompt_len"] == 1  # the raw string "x", not a token suffix
+
+
+def test_prompt_cache_untrimmable_is_rebuilt_then_dropped(fake_mlx, make_entry, monkeypatch):
+    """An existing cache that stops being trimmable is rebuilt, then dropped on finalize."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False)
+    p = SamplingParams(max_tokens=8)
+    list(mgr.stream_chat("A", [{"role": "user", "content": "hi"}], p))
+    lm = mgr.get("A")
+    assert lm.cache is not None
+    monkeypatch.setattr(
+        sys.modules["mlx_lm.models.cache"], "can_trim_prompt_cache", lambda c: False
+    )
+    list(mgr.stream_chat("A", [{"role": "user", "content": "hi again"}], p))
+    assert lm.cache is None and lm.cache_tokens == []
+
+
+def test_prompt_cache_setup_failure_falls_back(fake_mlx, make_entry, monkeypatch):
+    """A cache build error releases the lock and prefills the full string prompt."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False)
+    lm = mgr.get("A")
+
+    def boom(model, *a, **k):
+        raise RuntimeError("no cache")
+
+    monkeypatch.setattr(sys.modules["mlx_lm.models.cache"], "make_prompt_cache", boom)
+    list(mgr.stream_chat("A", [{"role": "user", "content": "hi"}], SamplingParams(max_tokens=8)))
+    assert lm.cache is None
+    assert not lm.cache_lock.locked()  # lock was released on the fallback path
+    assert fake_mlx["last_prompt_len"] == len("PROMPT:hi")
+
+
+def test_prompt_cache_finalize_failure_drops_cache(fake_mlx, make_entry, monkeypatch):
+    """A trim error while finalizing drops the cache rather than leaving it inconsistent."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False)
+    lm = mgr.get("A")
+
+    def trim(cache, n):
+        if n > 0:  # prepare trims 0 (fine); finalize trims the generated tokens
+            raise RuntimeError("trim failed")
+        return 0
+
+    monkeypatch.setattr(sys.modules["mlx_lm.models.cache"], "trim_prompt_cache", trim)
+    list(mgr.stream_chat("A", [{"role": "user", "content": "hi"}], SamplingParams(max_tokens=8)))
+    assert lm.cache is None and lm.cache_tokens == []
+
+
 def _char_stream(text, finish="stop"):
     """A stream_generate stand-in that emits `text` one character per step."""
 
-    def gen(model, tokenizer, prompt, max_tokens, sampler):
+    def gen(model, tokenizer, prompt, max_tokens, **kwargs):
         last = len(text) - 1
         for i, ch in enumerate(text):
             yield types.SimpleNamespace(
@@ -175,7 +401,7 @@ def _char_stream(text, finish="stop"):
 def _chunk_stream(chunks, finish="stop"):
     """A stream_generate stand-in that emits `chunks` verbatim, terminal last."""
 
-    def gen(model, tokenizer, prompt, max_tokens, sampler):
+    def gen(model, tokenizer, prompt, max_tokens, **kwargs):
         last = len(chunks) - 1
         for i, c in enumerate(chunks):
             yield types.SimpleNamespace(
@@ -246,7 +472,7 @@ def test_harmony_preserves_literal_angle_brackets(fake_mlx, make_entry, monkeypa
     assert "".join(c.text for c in out) == "a <| b < c"
 
 
-class FakeToolTokenizer:
+class FakeToolTokenizer(_EncTokenizer):
     """A tool-capable tokenizer: `<tool_call>`-delimited JSON, echoing tools passed."""
 
     has_tool_calling = True
@@ -346,7 +572,7 @@ def test_parse_tool_calls_passthrough_without_markers():
     assert out == chunks
 
 
-class FakeHarmonyTokenizer:
+class FakeHarmonyTokenizer(_EncTokenizer):
     """gpt-oss: reports no has_tool_calling; Harmony support inferred from vocab."""
 
     has_tool_calling = False
@@ -439,6 +665,38 @@ def test_harmony_multiple_tool_calls(fake_mlx, make_entry, monkeypatch):
     assert names == ["a", "b"]
 
 
+def test_harmony_tool_call_empty_args(fake_mlx, make_entry, monkeypatch):
+    """A no-argument commentary call emits `"{}"`, not `""` (clients JSON.parse it)."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_harmony_tokenizer(monkeypatch)
+    body = "<|channel|>commentary to=functions.f<|message|><|call|>"
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream(body))
+    out = _tool_chat(
+        ModelManager(start_reaper=False), [{"type": "function", "function": {"name": "f"}}]
+    )
+    calls = [tc for c in out for tc in c.tool_calls]
+    assert len(calls) == 1 and calls[0]["function"]["name"] == "f"
+    assert calls[0]["function"]["arguments"] == "{}"
+    assert json.loads(calls[0]["function"]["arguments"]) == {}
+
+
+def test_format_tool_call_empty_arguments():
+    """Empty / whitespace argument bodies normalize to `"{}"`; real payloads pass through."""
+    assert engine._format_tool_call({"name": "f", "arguments": ""})["function"]["arguments"] == "{}"
+    assert (
+        engine._format_tool_call({"name": "f", "arguments": "  "})["function"]["arguments"] == "{}"
+    )
+    assert engine._format_tool_call({"name": "f", "arguments": {}})["function"]["arguments"] == "{}"
+    assert (
+        engine._format_tool_call({"name": "f", "arguments": {"x": 1}})["function"]["arguments"]
+        == '{"x": 1}'
+    )
+    assert (
+        engine._format_tool_call({"name": "f", "arguments": '{"x": 1}'})["function"]["arguments"]
+        == '{"x": 1}'
+    )
+
+
 def test_harmony_plain_answer_yields_no_tool_calls(fake_mlx, make_entry, monkeypatch):
     """A normal Harmony answer (no commentary call) produces no tool_calls, finish stop."""
     registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
@@ -493,7 +751,7 @@ def test_seed_is_applied(fake_mlx, make_entry):
 def test_stream_reports_length_finish(fake_mlx, make_entry, monkeypatch):
     registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
 
-    def truncated(model, tokenizer, prompt, max_tokens, sampler):
+    def truncated(model, tokenizer, prompt, max_tokens, **kwargs):
         yield types.SimpleNamespace(
             text="a", finish_reason=None, prompt_tokens=1, generation_tokens=1
         )

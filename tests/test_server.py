@@ -33,6 +33,7 @@ class FakeManager:
         self.tool_calls = tool_calls
         self.seen_messages = None  # last messages passed to stream_chat
         self.seen_tools = None  # last tools passed to stream_chat
+        self.seen_sampling = None  # last SamplingParams passed to stream_chat
 
     def loaded(self):
         return "Llama" if not self.raises else None
@@ -73,6 +74,7 @@ class FakeManager:
     def stream_chat(self, name, messages, *a, tools=None, **k):
         self.seen_messages = messages
         self.seen_tools = tools
+        self.seen_sampling = a[0] if a else None
         return self._gen()
 
     def stream_text(self, *a, **k):
@@ -199,6 +201,26 @@ def test_list_models(client, make_entry):
     assert body["object"] == "list"
     assert body["data"][0]["id"] == "Llama"
     assert body["data"][0]["quant"] == "4bit"
+
+
+def test_sampling_maps_openai_fields():
+    """Request sampling fields map onto SamplingParams; logit_bias keys coerce to int."""
+    from omlx.protocol import ChatRequest
+
+    req = ChatRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        frequency_penalty=0.5,
+        presence_penalty=0.25,
+        top_k=20,
+        min_p=0.1,
+        repetition_penalty=1.2,
+        logit_bias={"50256": -100.0, "notanint": 1.0},
+    )
+    s = req.sampling()
+    assert s.frequency_penalty == 0.5 and s.presence_penalty == 0.25
+    assert s.top_k == 20 and s.min_p == 0.1 and s.repetition_penalty == 1.2
+    assert s.logit_bias == {50256: -100.0}  # non-integer key dropped
 
 
 def test_chat_non_stream(client):
@@ -456,3 +478,269 @@ def test_non_stream_error_returns_500(make_client, path, body):
 def test_stream_error_emits_error_chunk(make_client, path, body):
     r = make_client(raises=True).post(path, json=body)
     assert '"error"' in r.text
+
+
+# --- Ollama native API ------------------------------------------------------
+
+
+def _ndjson_lines(text):
+    """Parse each non-empty NDJSON line into a JSON object."""
+    return [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+
+
+def test_root_is_ollama_probe(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert r.text == "Ollama is running"
+
+
+def test_api_chat_non_stream(client):
+    r = client.post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["model"] == "Llama"
+    assert body["message"] == {"role": "assistant", "content": "hello"}
+    assert body["done"] is True
+    assert body["done_reason"] == "stop"
+    assert body["prompt_eval_count"] == 5
+    assert body["eval_count"] == 2
+
+
+def test_api_chat_stream_ndjson_framing(client):
+    r = client.post(
+        "/api/chat",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    # NDJSON, not SSE: no `data:` prefix and no `[DONE]` sentinel.
+    assert "data:" not in r.text and "[DONE]" not in r.text
+    frames = _ndjson_lines(r.text)
+    assert "".join(f["message"]["content"] for f in frames if not f["done"]) == "hello"
+    assert [f["done"] for f in frames][:-1] == [False] * (len(frames) - 1)
+    terminal = frames[-1]
+    assert terminal["done"] is True
+    assert terminal["done_reason"] == "stop"
+    assert terminal["eval_count"] == 2
+
+
+def test_api_chat_defaults_to_streaming(client):
+    """Ollama `stream` defaults to true, unlike the OpenAI routes."""
+    r = client.post(
+        "/api/chat",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    frames = _ndjson_lines(r.text)
+    assert len(frames) > 1 and frames[-1]["done"] is True
+
+
+def test_api_chat_thinking_present(make_client):
+    r = make_client(chunks=("answer",), reasonings=("because",)).post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "think": True,
+            "stream": False,
+        },
+    )
+    assert r.json()["message"]["thinking"] == "because"
+
+
+def test_api_chat_thinking_omitted_when_think_false(make_client):
+    r = make_client(chunks=("answer",), reasonings=("because",)).post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "think": False,
+            "stream": False,
+        },
+    )
+    assert "thinking" not in r.json()["message"]
+
+
+def test_api_chat_stream_thinking(make_client):
+    r = make_client(chunks=("answer",), reasonings=("because",)).post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "think": True,
+        },
+    )
+    frames = _ndjson_lines(r.text)
+    assert any(f["message"].get("thinking") == "because" for f in frames if not f["done"])
+
+
+def test_api_chat_stream_tool_calls_arguments_are_object(make_client):
+    r = make_client(chunks=("",), tool_calls=[_TOOL_CALL]).post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    frames = _ndjson_lines(r.text)
+    calls = [tc for f in frames if not f["done"] for tc in f["message"].get("tool_calls", [])]
+    assert calls == [{"function": {"name": "get_weather", "arguments": {"city": "NYC"}}}]
+
+
+def test_api_chat_tool_calls_arguments_are_object(make_client):
+    """Ollama tool calls carry `arguments` as an object, not an OpenAI JSON string."""
+    r = make_client(chunks=("",), tool_calls=[_TOOL_CALL]).post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+            "stream": False,
+        },
+    )
+    body = r.json()
+    assert body["done_reason"] == "tool_calls"
+    tc = body["message"]["tool_calls"][0]
+    assert tc == {"function": {"name": "get_weather", "arguments": {"city": "NYC"}}}
+
+
+def test_api_chat_maps_options_to_sampling(client):
+    client.post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"num_predict": 32, "temperature": 0.1, "repeat_penalty": 1.2},
+            "stream": False,
+        },
+    )
+    params = server.MANAGER.seen_sampling
+    assert params.max_tokens == 32
+    assert params.temperature == 0.1
+    assert params.repetition_penalty == 1.2
+
+
+def test_api_generate_non_stream(client):
+    r = client.post("/api/generate", json={"model": "Llama", "prompt": "hi", "stream": False})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["response"] == "hello"
+    assert body["done"] is True
+    assert body["eval_count"] == 2
+
+
+def test_api_generate_stream_ndjson(client):
+    r = client.post("/api/generate", json={"model": "Llama", "prompt": "hi"})
+    frames = _ndjson_lines(r.text)
+    assert "".join(f["response"] for f in frames) == "hello"
+    assert frames[-1]["done"] is True
+
+
+def test_api_generate_thinking(make_client):
+    r = make_client(chunks=("answer",), reasonings=("because",)).post(
+        "/api/generate",
+        json={"model": "Llama", "prompt": "hi", "think": True, "stream": False},
+    )
+    assert r.json()["thinking"] == "because"
+
+
+def test_api_generate_stream_thinking(make_client):
+    r = make_client(chunks=("answer",), reasonings=("because",)).post(
+        "/api/generate",
+        json={"model": "Llama", "prompt": "hi", "think": True},
+    )
+    frames = _ndjson_lines(r.text)
+    assert any(f.get("thinking") == "because" for f in frames if not f["done"])
+
+
+def test_api_generate_stream_error_emits_error_line(make_client):
+    r = make_client(raises=True).post("/api/generate", json={"model": "Llama", "prompt": "hi"})
+    assert '"error"' in r.text
+
+
+def test_api_generate_raw_uses_bare_prompt(client):
+    """`raw` bypasses the chat template (routes through stream_text)."""
+    r = client.post(
+        "/api/generate",
+        json={"model": "Llama", "prompt": "hi", "raw": True, "stream": False},
+    )
+    assert r.json()["response"] == "hello"
+    assert server.MANAGER.seen_messages is None  # stream_chat not used
+
+
+def test_api_generate_folds_in_system(client):
+    client.post(
+        "/api/generate",
+        json={"model": "Llama", "prompt": "hi", "system": "be terse", "stream": False},
+    )
+    seen = server.MANAGER.seen_messages
+    assert seen[0] == {"role": "system", "content": "be terse"}
+    assert seen[1] == {"role": "user", "content": "hi"}
+
+
+def test_api_generate_non_stream_error_returns_500(make_client):
+    r = make_client(raises=True).post(
+        "/api/generate", json={"model": "Llama", "prompt": "hi", "stream": False}
+    )
+    assert r.status_code == 500
+
+
+def test_api_pull_stream_error_emits_error_line(client, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("no such repo")
+
+    monkeypatch.setattr("omlx.pull.pull", boom)
+    r = client.post("/api/pull", json={"model": "org/Repo"})
+    frames = _ndjson_lines(r.text)
+    assert "error" in frames[-1]
+
+
+def test_api_chat_non_stream_error_returns_500(make_client):
+    r = make_client(raises=True).post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+    )
+    assert r.status_code == 500
+
+
+def test_api_chat_stream_error_emits_error_line(make_client):
+    r = make_client(raises=True).post(
+        "/api/chat",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert '"error"' in r.text
+
+
+def test_api_pull_non_stream(client, monkeypatch):
+    pulled = []
+    monkeypatch.setattr("omlx.pull.pull", lambda model, *a, **k: pulled.append(model))
+    r = client.post("/api/pull", json={"model": "org/Repo", "stream": False})
+    assert r.status_code == 200
+    assert r.json() == {"status": "success"}
+    assert pulled == ["org/Repo"]
+
+
+def test_api_pull_stream(client, monkeypatch):
+    monkeypatch.setattr("omlx.pull.pull", lambda model, *a, **k: None)
+    r = client.post("/api/pull", json={"name": "org/Repo"})  # `name` legacy alias
+    frames = _ndjson_lines(r.text)
+    assert frames[-1] == {"status": "success"}
+
+
+def test_api_pull_error_returns_500(client, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("no such repo")
+
+    monkeypatch.setattr("omlx.pull.pull", boom)
+    r = client.post("/api/pull", json={"model": "org/Repo", "stream": False})
+    assert r.status_code == 500

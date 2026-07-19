@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     )
     max_mem_mb: int | None = None
     mem_budget_fraction: float = _MEM_BUDGET_FRACTION_DEFAULT
+    # Reuse a per-model KV cache across turns, prefilling only the diverging
+    # suffix of the prompt. Disable to prefill the full prompt every request.
+    prompt_cache: bool = True
+    # Quantized KV cache. `kv_bits` None keeps the cache in full precision;
+    # otherwise entries past `quantized_kv_start` tokens are quantized to that
+    # bit width, trading a little quality for less KV memory on long contexts.
+    kv_bits: int | None = None
+    kv_group_size: int = 64
+    quantized_kv_start: int = 5000
 
     @property
     def registry_path(self) -> Path:

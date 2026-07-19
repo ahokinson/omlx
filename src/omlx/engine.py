@@ -11,7 +11,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,6 +33,15 @@ class LoadedModel:
     last_used: float
     size_bytes: int = 0
     active: int = 0  # in-flight generations on this model; protects against eviction
+    # Reusable KV prompt cache and the token ids it holds. Invariant: at rest
+    # `len(cache_tokens) == cache[0].offset` — the cache holds exactly the last
+    # prompt (generated tokens are trimmed off after each turn), so the next
+    # request need only prefill the diverging suffix. Guarded by `cache_lock`;
+    # a request that can't take the lock (a concurrent generation holds it) runs
+    # with its own throwaway cache and leaves this one untouched.
+    cache: Any = None
+    cache_tokens: list[int] = field(default_factory=list)
+    cache_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -265,7 +274,9 @@ class ModelManager:
         if offer_tools:
             template_kwargs["tools"] = tools
         prompt = tok.apply_chat_template(messages, **template_kwargs)
-        stream = _parse_harmony(self._stream_prompt(lm, prompt, params or SamplingParams()))
+        stream = _parse_harmony(
+            self._stream_prompt(lm, prompt, params or SamplingParams(), use_cache=True)
+        )
         if generic_tools:
             stream = _parse_tool_calls(
                 stream,
@@ -284,34 +295,107 @@ class ModelManager:
         yield from self._stream_prompt(lm, prompt, params or SamplingParams())
 
     def _stream_prompt(
-        self, lm: LoadedModel, prompt: str, params: SamplingParams
+        self, lm: LoadedModel, prompt: str, params: SamplingParams, use_cache: bool = False
     ) -> Iterator[Completion]:
+        """Stream a prompt, optionally reusing/extending the model's KV prompt cache.
+
+        With `use_cache`, only the suffix of `prompt` that diverges from the
+        cached prefix is prefilled; `mlx-lm` reports `prompt_tokens` for that
+        suffix only, so the reused-prefix length is added back to keep the usage
+        count the full prompt size.
+        """
         from mlx_lm import stream_generate
-        from mlx_lm.sample_utils import make_sampler
 
         if params.seed is not None:
             import mlx.core as mx  # ty: ignore[unresolved-import]
 
             mx.random.seed(params.seed)
-        sampler = make_sampler(temp=params.temperature, top_p=params.top_p)
+        kwargs = _generation_kwargs(params)
+        prompt_arg, offset, cache, tokens = self._prepare_cache(lm, prompt, use_cache)
+        if cache is not None:
+            kwargs["prompt_cache"] = cache
         gen = stream_generate(
             lm.model,
             lm.tokenizer,
-            prompt=prompt,
+            prompt=prompt_arg,
             max_tokens=params.max_tokens,
-            sampler=sampler,
+            **kwargs,
         )
-        with self._active_generation(lm):
-            if not params.stop:
-                for resp in gen:
-                    yield Completion(
-                        text=resp.text,
-                        finish_reason=resp.finish_reason,
-                        prompt_tokens=resp.prompt_tokens,
-                        completion_tokens=resp.generation_tokens,
-                    )
-            else:
-                yield from _stream_with_stops(gen, params.stop)
+        try:
+            with self._active_generation(lm):
+                if not params.stop:
+                    for resp in gen:
+                        yield _completion(resp, offset)
+                else:
+                    for comp in _stream_with_stops(gen, params.stop):
+                        yield _with_offset(comp, offset)
+        finally:
+            if tokens is not None:
+                self._finalize_cache(lm, cache, tokens)
+                lm.cache_lock.release()
+
+    def _prepare_cache(
+        self, lm: LoadedModel, prompt: str, use_cache: bool
+    ) -> tuple[Any, int, Any, list[int] | None]:
+        """Resolve the prefill input, reusing the model's KV cache when possible.
+
+        Returns `(prompt_arg, offset, cache, tokens)`. When caching is off or the
+        cache is busy, `prompt_arg` is the original string, `cache`/`tokens` are
+        None, and `offset` is 0 — the plain, non-cached path. When caching is
+        active, the cache lock is held (released by `_stream_prompt` once the
+        stream ends), `prompt_arg` is the diverging suffix (an `mx.array`),
+        `offset` is the reused-prefix length, and `tokens` is the full prompt.
+        """
+        if not (use_cache and settings.prompt_cache):
+            return prompt, 0, None, None
+        if not lm.cache_lock.acquire(blocking=False):
+            return prompt, 0, None, None
+        try:
+            import mlx.core as mx  # ty: ignore[unresolved-import]
+            from mlx_lm.models.cache import (
+                can_trim_prompt_cache,
+                make_prompt_cache,
+                trim_prompt_cache,
+            )
+
+            tokens = _encode_prompt(lm.tokenizer, prompt)
+            if len(tokens) < 2:
+                lm.cache_lock.release()
+                return prompt, 0, None, None
+            cache = lm.cache
+            if cache is None or not can_trim_prompt_cache(cache):
+                cache = make_prompt_cache(lm.model)
+                lm.cache, lm.cache_tokens = cache, []
+            # Reuse the longest common prefix, but keep >=1 token to prefill.
+            common = min(_lcp(lm.cache_tokens, tokens), len(tokens) - 1)
+            trim_prompt_cache(cache, len(lm.cache_tokens) - common)
+            return mx.array(tokens[common:]), common, cache, tokens
+        except Exception as e:
+            logger.debug("prompt-cache setup failed (%s); prefilling full prompt", e)
+            lm.cache_lock.release()
+            return prompt, 0, None, None
+
+    def _finalize_cache(self, lm: LoadedModel, cache: Any, tokens: list[int]) -> None:
+        """Trim generated tokens so the cache again holds exactly `tokens`.
+
+        Restores the resting invariant (`len(cache_tokens) == cache offset`) so
+        the next turn's prefix match is correct. A cache that can't be trimmed
+        (e.g. quantized past the KV-quant threshold) is dropped rather than left
+        inconsistent.
+        """
+        try:
+            from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
+
+            if not can_trim_prompt_cache(cache):
+                lm.cache, lm.cache_tokens = None, []
+                return
+            extra = cache[0].offset - len(tokens)
+            if extra > 0:
+                trim_prompt_cache(cache, extra)
+            lm.cache, lm.cache_tokens = cache, tokens
+        except Exception as e:
+            logger.debug("prompt-cache finalize failed (%s); dropping cache", e)
+            lm.cache, lm.cache_tokens = None, []
 
     @contextmanager
     def _active_generation(self, lm: LoadedModel) -> Iterator[None]:
@@ -349,6 +433,79 @@ class ModelManager:
 
 
 MANAGER = ModelManager()
+
+
+def _encode_prompt(tok: Any, prompt: str) -> list[int]:
+    """Tokenize `prompt` the way `stream_generate` would for a string input.
+
+    Mirrors mlx-lm's BOS heuristic so a suffix fed as token ids reconstructs the
+    same sequence the string path would have produced.
+    """
+    bos = getattr(tok, "bos_token", None)
+    add_special = bos is None or not prompt.startswith(bos)
+    return list(tok.encode(prompt, add_special_tokens=add_special))
+
+
+def _lcp(a: list[int], b: list[int]) -> int:
+    """Length of the longest common prefix of two token sequences."""
+    n = 0
+    for x, y in zip(a, b, strict=False):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _completion(resp: Any, offset: int) -> Completion:
+    """A `stream_generate` step -> `Completion`, adding the reused-prefix length.
+
+    The prefix length is added only on the terminal step, where usage is read;
+    intermediate `prompt_tokens` are ignored downstream.
+    """
+    prompt_tokens = resp.prompt_tokens + (offset if resp.finish_reason is not None else 0)
+    return Completion(
+        text=resp.text,
+        finish_reason=resp.finish_reason,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=resp.generation_tokens,
+    )
+
+
+def _with_offset(comp: Completion, offset: int) -> Completion:
+    """Add the reused-prefix length to a terminal completion's prompt token count."""
+    if offset and comp.finish_reason is not None:
+        return replace(comp, prompt_tokens=comp.prompt_tokens + offset)
+    return comp
+
+
+def _generation_kwargs(params: SamplingParams) -> dict[str, Any]:
+    """Sampler, logits processors, and KV-cache options for `stream_generate`.
+
+    Non-default sampling fields (`top_k`, `min_p`, the penalties, `logit_bias`)
+    are honored here; `make_logits_processors` no-ops on zero/None so the
+    processor list is None unless a penalty or bias was requested. KV-cache
+    quantization is server-wide (`OMLX_KV_BITS`), applied only when set.
+    """
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+    sampler = make_sampler(
+        temp=params.temperature,
+        top_p=params.top_p,
+        min_p=params.min_p,
+        top_k=params.top_k,
+    )
+    processors = make_logits_processors(
+        logit_bias=params.logit_bias,
+        repetition_penalty=params.repetition_penalty,
+        presence_penalty=params.presence_penalty,
+        frequency_penalty=params.frequency_penalty,
+    )
+    kwargs: dict[str, Any] = {"sampler": sampler, "logits_processors": processors or None}
+    if settings.kv_bits is not None:
+        kwargs["kv_bits"] = settings.kv_bits
+        kwargs["kv_group_size"] = settings.kv_group_size
+        kwargs["quantized_kv_start"] = settings.quantized_kv_start
+    return kwargs
 
 
 def _earliest_stop(text: str, stops: tuple[str, ...]) -> int | None:
@@ -604,14 +761,23 @@ def _tool_partial_suffix(buf: str, delim: str) -> int:
 
 
 def _format_tool_call(tc: dict[str, Any]) -> dict[str, Any]:
-    """One parser result -> OpenAI `tool_calls` entry (arguments as a JSON string)."""
+    """One parser result -> OpenAI `tool_calls` entry (arguments as a JSON string).
+
+    An empty arguments body (a no-argument call) is emitted as `"{}"`, not `""`:
+    the wire contract is a JSON string, and clients (e.g. opencode) `JSON.parse`
+    it, which rejects the empty string.
+    """
     args = tc.get("arguments", {})
+    if isinstance(args, str):
+        arguments = args if args.strip() else "{}"
+    else:
+        arguments = json.dumps(args, ensure_ascii=False)
     return {
         "id": tc.get("id") or f"call_{uuid.uuid4().hex}",
         "type": "function",
         "function": {
             "name": tc.get("name", ""),
-            "arguments": args if isinstance(args, str) else json.dumps(args, ensure_ascii=False),
+            "arguments": arguments,
         },
     }
 

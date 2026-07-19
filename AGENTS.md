@@ -55,8 +55,39 @@ shape, update those tests intentionally, never by accident.
     `engine._parse_tool_calls`); gpt-oss/Harmony via the commentary
     `to=functions.NAME` channel (`engine._HarmonyParser`). Absent when no
     tools/calls. `tests/test_server.py` and `tests/test_engine.py` pin it.
+  - **Sampling**: `_SamplingRequest` accepts `temperature`, `top_p`, `top_k`,
+    `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, and
+    `logit_bias` (OpenAI token-id-string keys, coerced to int in
+    `protocol._int_keyed`). `engine._generation_kwargs` maps these onto
+    `mlx-lm`'s `make_sampler` / `make_logits_processors`; the penalties/bias are
+    no-ops at their defaults so the processor list stays None.
   - Object tags: `chat.completion` / `chat.completion.chunk` for chat;
     `text_completion` for completions.
+- **Ollama native API** on the same port:
+  - `POST /api/chat` and `POST /api/generate`, stream + non-stream. Streaming
+    uses **NDJSON** (one JSON object per line, `{...}\n`, no `data:` prefix and
+    no `[DONE]` sentinel); `stream` **defaults to `true`** (opposite of the
+    OpenAI routes). Per-token frames carry `done: false`; the terminal frame has
+    `done: true`, a `done_reason`, and timing/count stats (`prompt_eval_count` /
+    `eval_count` exact; durations best-effort). Chat carries `message: {role,
+    content, thinking?, tool_calls?}`; generate carries a flat `response` string.
+    Mid-stream errors emit a trailing `{"error": ...}` line; non-stream errors
+    return HTTP 500.
+  - **Reasoning** rides `message.thinking` (chat) / top-level `thinking`
+    (generate), emitted when the request sets `think`. **Tool-call `arguments`
+    is a JSON object**, not the OpenAI JSON string, and the call is
+    `{"function": {name, arguments}}` with no `id`/`type`/`index`.
+  - **Sampling** lives under `options` (`num_predict` → `max_tokens`,
+    `repeat_penalty` → `repetition_penalty`, plus `temperature`/`top_p`/`top_k`/
+    `min_p`/`frequency_penalty`/`presence_penalty`/`stop`/`seed`);
+    `OllamaOptions.to_sampling` maps them. `keep_alive` and `format` are accepted
+    but ignored.
+  - `POST /api/pull` downloads + registers a model (coarse NDJSON progress: a
+    `pulling` frame then `success`; the HF download is blocking).
+  - `GET /` returns the literal `Ollama is running` (Ollama liveness probe).
+  - Wire shapes and NDJSON envelope builders live in `protocol.py`
+    (`ollama_chat_response`/`_collect`, `ollama_generate_response`/`_collect`);
+    `tests/test_server.py` pins them.
 - **CLI surface**: `omlx pull|list|rm|run|serve|daemon start|stop|status`.
   Don't rename commands or flags.
 - **Config**: `OMLX_*` env vars via `pydantic-settings`. `OMLX_KEEPALIVE` is a
@@ -66,12 +97,22 @@ shape, update those tests intentionally, never by accident.
   caps are unset (default), the budget = fraction × probed system memory and
   the count cap is derived from it (~1 model per 8 GiB); an explicitly
   requested model is loaded even if it alone exceeds the budget (Ollama parity).
+  `OMLX_PROMPT_CACHE` (default on) toggles KV prompt-cache reuse;
+  `OMLX_KV_BITS` (+ `OMLX_KV_GROUP_SIZE`, `OMLX_QUANTIZED_KV_START`) enable
+  quantized KV caching.
 - **Engine**: `ModelManager` keeps multiple models resident in an LRU
   `OrderedDict`; each `LoadedModel` has a per-model `active` counter (not a
   global one) so a generation on model A doesn't protect an idle model B.
   Resident `size_bytes` is backfilled after `mlx_lm.load` from
   `mx.get_active_memory()` (delta vs a baseline captured before the load),
   falling back to the registry entry's `size_bytes`, then to a 1 GiB minimum.
+- **Prompt cache**: each `LoadedModel` holds a reusable KV cache guarded by
+  `cache_lock`. `stream_chat` prefills only the prompt suffix that diverges from
+  the cached prefix (`_prepare_cache`), then trims generated tokens back off so
+  the resting invariant `len(cache_tokens) == cache offset` holds
+  (`_finalize_cache`). A request that can't take the lock (a concurrent
+  generation) runs with a throwaway cache; usage `prompt_tokens` adds the reused
+  prefix length back so it reports the full prompt size.
 - **Storage**: HF hub cache (`~/.cache/huggingface/hub`) for weights; index at
   `~/.omlx/models.json` mapping friendly name -> repo/path/metadata. The JSON
   shape (the `asdict(ModelEntry)`) is the on-disk format.
