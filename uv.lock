@@ -638,6 +638,7 @@ dependencies = [
     { name = "mlx-lm" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "rich" },
     { name = "typer" },
     { name = "uvicorn" },
 ]
@@ -658,6 +659,7 @@ requires-dist = [
     { name = "mlx-lm", specifier = ">=0.21" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pydantic-settings", specifier = ">=2.14" },
+    { name = "rich", specifier = ">=13" },
     { name = "typer", specifier = ">=0.12" },
     { name = "uvicorn", specifier = ">=0.29" },
 ]

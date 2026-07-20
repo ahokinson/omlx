@@ -8,6 +8,7 @@ dependencies = [
     "mlx-lm>=0.21",
     "huggingface_hub[hf_xet]>=0.30",
     "typer>=0.12",
+    "rich>=13",
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "httpx2>=2.5",

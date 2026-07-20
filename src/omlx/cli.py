@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import typer
 
-from . import daemon, registry
+from . import _ui, daemon, registry
 from ._fmt import human_size
 from .client import StreamError
 from .config import ensure_dirs, settings
@@ -49,7 +49,7 @@ def _stream_once(
                 typer.echo(delta, nl=False)
                 out.append(delta)
     except StreamError as e:
-        typer.echo(f"\n[error] {e}", err=True)
+        _ui.error(f"[error] {e}")
         raise
     finally:
         typer.echo("")
@@ -72,7 +72,7 @@ def pull(
     from .pull import pull as do_pull
 
     entry = do_pull(repo_id, revision=revision, convert=convert, bits=bits, name=name)
-    typer.echo(
+    _ui.success(
         f"pulled {entry.name}  ({human_size(entry.size_bytes)}, quant={entry.quant or 'none'})"
     )
 
@@ -84,11 +84,7 @@ def list_models():
     if not rows:
         typer.echo("no models; pull one with `omlx pull <repo>`")
         return
-    name_w = max(len(r.name) for r in rows)
-    for r in sorted(rows, key=lambda x: x.name):
-        typer.echo(
-            f"{r.name:<{name_w}}  {human_size(r.size_bytes):>9}  {r.quant or '-':>6}  {r.repo_id}"
-        )
+    _ui.models_table(rows)
 
 
 @app.command()
@@ -101,9 +97,9 @@ def rm(
     """Remove a model from the registry and purge its cache snapshot."""
     entry = registry.remove(name, purge=not keep_cache)
     if entry is None:
-        typer.echo(f"no such model: {name}")
+        _ui.console.print(f"no such model: {name}", style="red", highlight=False, markup=False)
         raise typer.Exit(1)
-    typer.echo(f"removed {entry.name}")
+    _ui.success(f"removed {entry.name}")
 
 
 @app.command()
@@ -160,11 +156,14 @@ def run(
             raise typer.Exit(1) from e
         return
 
-    typer.echo(f"omlx: chatting with {model}. Type /bye to exit.\n")
+    _ui.console.print(
+        f"omlx: chatting with [cyan]{model}[/cyan]. Type [dim]/bye[/dim] to exit.\n",
+        highlight=False,
+    )
     history: list[dict[str, str]] = []
     while True:
         try:
-            user = typer.prompt(">>>", prompt_suffix=" ")
+            user = typer.prompt(typer.style(">>>", fg="cyan", bold=True), prompt_suffix=" ")
         except (EOFError, KeyboardInterrupt):
             typer.echo("")
             break

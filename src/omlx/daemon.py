@@ -11,7 +11,6 @@ import sys
 import time
 
 import httpx2
-import typer
 
 from .config import ensure_dirs, settings
 
@@ -24,7 +23,9 @@ POLL_INTERVAL = 0.4
 
 
 def _echo(msg: str) -> None:
-    typer.echo(f"[omlx] {msg}")
+    from ._ui import info
+
+    info(f"[omlx] {msg}")
 
 
 def _read_pid() -> int | None:
@@ -90,7 +91,10 @@ def start() -> None:
         )
     settings.pid_path.write_text(str(proc.pid))
     try:
-        _wait_healthy(proc.pid)
+        from ._ui import status
+
+        with status(f"starting daemon at {settings.base_url}…"):
+            _wait_healthy(proc.pid)
     except RuntimeError:
         # Startup timed out; the child may still be alive (slow import/model
         # load). Kill it before dropping the pidfile, else it orphans, holds the

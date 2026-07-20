@@ -106,9 +106,19 @@ def pull(
 
     # Reuse the cached snapshot when the weights are already present; only hit the
     # network (hf_xet Xet-accelerated for Xet-backed repos) on a cache miss.
-    snapshot = _cached_snapshot(repo_id, revision) or Path(
-        snapshot_download(repo_id, revision=revision, allow_patterns=_ALLOW_PATTERNS)
-    )
+    snapshot = _cached_snapshot(repo_id, revision)
+    if snapshot is None:
+        from ._ui import download_progress
+
+        with download_progress() as tqdm_cls:
+            snapshot = Path(
+                snapshot_download(
+                    repo_id,
+                    revision=revision,
+                    allow_patterns=_ALLOW_PATTERNS,
+                    tqdm_class=tqdm_cls,
+                )
+            )
 
     if convert or not has_safetensors:
         entry = _convert(repo_id, snapshot, bits, name=name)
