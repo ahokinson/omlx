@@ -25,7 +25,7 @@ from rich.progress import (
 )
 from rich.table import Table
 from rich.text import Text
-from tqdm.std import tqdm as std_tqdm
+from tqdm.asyncio import tqdm_asyncio
 
 console = Console()
 err_console = Console(stderr=True)
@@ -44,7 +44,7 @@ class _NullSink:
         return False
 
 
-class _RichTqdm(std_tqdm):
+class _RichTqdm(tqdm_asyncio):
     """A ``tqdm`` drop-in that mirrors each bar into a shared rich ``Progress``.
 
     huggingface_hub creates one ``tqdm`` per file plus an outer "Fetching N

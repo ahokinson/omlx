@@ -4,6 +4,7 @@ import json
 import sys
 import threading
 import types
+from typing import Any
 
 import pytest
 
@@ -63,7 +64,7 @@ def fake_mlx(monkeypatch):
     so size-backfill tests can drive deterministic deltas without Metal.
     """
     # seed -1 = "not applied"; `threads` records the worker each mlx call ran on.
-    calls = {"load": 0, "active_mem": 0, "seed": -1, "threads": []}
+    calls: dict[str, Any] = {"load": 0, "active_mem": 0, "seed": -1, "threads": []}
 
     def load(source):
         calls["load"] += 1
