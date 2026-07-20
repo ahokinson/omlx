@@ -1044,6 +1044,55 @@ def test_evict_to_fit_skipped_when_all_resident_is_active(fake_mlx, make_entry, 
     assert resident == {"A", "B"}
 
 
+def test_get_reuses_model_that_lands_before_preevict(fake_mlx, make_entry, monkeypatch):
+    """A racer that finishes loading between the fast-path miss and the
+    pre-eviction lock is reused, not reloaded (the pre-evict dup re-check).
+    """
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False, mem_budget_mb=65536)
+
+    racer = engine.LoadedModel("A", object(), object(), engine.time.time())
+    real_resolve = mgr._resolve
+
+    def resolve_then_race(name):
+        source = real_resolve(name)
+        # Another caller lands "A" resident before we reach the pre-evict lock.
+        mgr._loaded["A"] = racer
+        return source
+
+    monkeypatch.setattr(mgr, "_resolve", resolve_then_race)
+
+    got = mgr.get("A")
+    assert got is racer
+    assert fake_mlx["load"] == 0  # our own load never ran
+
+
+def test_evicts_before_loading_new_model(fake_mlx, make_entry, monkeypatch):
+    """Over-budget eviction must happen *before* the new model is loaded, else
+    the old and new models are briefly co-resident in GPU memory — which on
+    Metal is an uncatchable OOM abort that crashes the daemon.
+    """
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    registry.add(make_entry(name="B", repo_id="org/B", path="/p"))
+    # Budget fits one model (each floors to 1 GiB); loading B must evict A first.
+    mgr = ModelManager(start_reaper=False, mem_budget_mb=1024, max_loaded=4)
+    mgr.get("A")
+
+    resident_at_load = {}
+    real_load = sys.modules["mlx_lm"].load
+
+    def spy_load(source):
+        resident_at_load["names"] = set(mgr._loaded)
+        return real_load(source)
+
+    monkeypatch.setattr(sys.modules["mlx_lm"], "load", spy_load)
+    mgr.get("B")
+
+    # A was already gone when B's weights were loaded — never co-resident.
+    assert resident_at_load["names"] == set()
+    assert {info.name for info in mgr.loaded_models()} == {"B"}
+
+
 def test_evict_to_count_skipped_when_all_resident_is_active(fake_mlx, make_entry):
     """The "everything resident is active" branch of _evict_to_count_locked."""
     registry.add(make_entry(name="A", repo_id="org/A", path="/p"))

@@ -167,9 +167,25 @@ class ModelManager:
                 lm.last_used = time.time()
                 return lm
 
-        # Resolve + load outside the lock: a cold pull/load can take minutes,
-        # and holding the lock would block /health the whole time.
         source = self._resolve(name)
+        entry = registry.get(name)
+
+        # Evict to fit the incoming model *before* loading it. Loading first
+        # would briefly hold every resident model plus the newcomer in GPU
+        # memory at once; on Metal that overflow is an uncatchable out-of-memory
+        # abort that takes the whole process down. The registry's recorded
+        # on-disk size is the pre-load size estimate.
+        with self._lock:
+            existing = self._loaded.get(name)
+            if existing is not None:
+                self._loaded.move_to_end(name)
+                existing.last_used = time.time()
+                return existing
+            self._evict_to_fit_locked(_estimate_size_bytes(None, None, entry))
+            self._evict_to_count_locked()
+
+        # Load outside the lock: a cold pull/load can take minutes, and holding
+        # the lock would block /health the whole time.
         baseline = _metal_active_memory()
         from mlx_lm import load
 
@@ -177,7 +193,7 @@ class ModelManager:
         # set; star-unpack tolerates either arity.
         model, tokenizer, *_ = load(source)
         post = _metal_active_memory()
-        size_bytes = _estimate_size_bytes(baseline, post, registry.get(name))
+        size_bytes = _estimate_size_bytes(baseline, post, entry)
 
         with self._lock:
             # Re-check after reacquiring the lock: another caller may have
@@ -188,6 +204,7 @@ class ModelManager:
                 self._loaded.move_to_end(name)
                 existing.last_used = time.time()
                 return existing
+            # Refine against the measured size in case it exceeded the estimate.
             self._evict_to_fit_locked(size_bytes)
             self._evict_to_count_locked()
             lm = LoadedModel(name, model, tokenizer, time.time(), size_bytes=size_bytes)
