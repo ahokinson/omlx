@@ -80,7 +80,33 @@ client.chat.completions.create(
 ```
 
 Endpoints: `GET /v1/models`, `POST /v1/chat/completions` (stream + non-stream),
-`POST /v1/completions`, `GET /health`.
+`POST /v1/completions`, `GET /health`. Streaming follows the OpenAI spec: the
+first chunk carries `delta: {"role": "assistant", "content": ""}`, and the
+trailing usage frame is emitted only when you send
+`stream_options: {"include_usage": true}` (default off). Unknown models return
+`404 {"error": {"code": "model_not_found"}}` rather than silently fetching —
+use `omlx pull` to populate the registry first.
+
+### JSON mode
+
+A `response_format: {"type": "json_object"}` request constrains generation to
+a valid JSON value via an in-house logits mask. `{"type": "json_schema"}`
+is rejected with `400 unsupported` in this round. `response_format` and
+`tools` are mutually exclusive (the OpenAI spec) — sending both is a
+`400 response_format_and_tools_mutually_exclusive`.
+
+```python
+client.chat.completions.create(
+    model="mlx-community/Llama-3.2-1B-Instruct-4bit",
+    messages=[{"role": "user", "content": "give a JSON weather report for SF"}],
+    response_format={"type": "json_object"},
+)
+```
+
+For Harmony / gpt-oss reasoning models the mask applies only inside the
+`final` channel — the `analysis` reasoning flows unmasked. Set
+`max_completion_tokens` so reasoning effort doesn't exhaust the budget before
+`final` runs.
 
 ## Ollama API
 
@@ -102,7 +128,10 @@ Endpoints: `POST /api/chat`, `POST /api/generate`, `POST /api/pull`,
 (one JSON object per line) and `stream` defaults to `true`, per Ollama; sampling
 rides the `options` block (`num_predict`, `temperature`, `repeat_penalty`, …).
 Reasoning models return the chain-of-thought in `message.thinking` (chat) or the
-top-level `thinking` field (generate) when the request sets `think`.
+top-level `thinking` field (generate) when the request sets `think`. The
+`format` field accepts the string `"json"` for JSON mode (the same `json_object`
+mask as the OpenAI side); a JSON-schema dict is rejected with
+`400 unsupported`.
 
 Not implemented: `/api/embed` (mlx-lm has no embedding path), `/api/copy`,
 `/api/create`, `/api/push`. `keep_alive` and `format` are accepted but ignored,

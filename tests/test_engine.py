@@ -117,11 +117,19 @@ def test_resolve_uses_registered_repo_id(make_entry):
     assert mgr._resolve("Llama") == "org/Llama"
 
 
-def test_resolve_auto_pulls_unknown(monkeypatch, make_entry):
-    pulled = make_entry(name="new", repo_id="org/new")
-    monkeypatch.setattr("omlx.pull.pull", lambda name: pulled)
+def test_resolve_raises_for_unknown_model():
+    """Auto-pull is restricted to `omlx pull` / `/api/pull`: an unknown model
+    on a generation route surfaces as an OpenAI-shaped 404, not a silent fetch.
+    """
+    from omlx.protocol import OpenAIError
+
     mgr = ModelManager(start_reaper=False)
-    assert mgr._resolve("org/new") == "org/new"
+    with pytest.raises(OpenAIError) as exc:
+        mgr._resolve("org/new")
+    assert exc.value.status == 404
+    assert exc.value.type == "not_found_error"
+    assert exc.value.code == "model_not_found"
+    assert exc.value.param == "model"
 
 
 def test_count_cap_honors_explicit_settings(monkeypatch):
@@ -923,6 +931,50 @@ def test_unload_all_when_empty_is_noop(fake_mlx):
     mgr = ModelManager(start_reaper=False, mem_budget_mb=65536)
     mgr._unload_locked(None)  # covers the early-return branch
     assert mgr.loaded_models() == []
+
+
+def test_generation_kwargs_prepends_json_provider(fake_mlx, monkeypatch):
+    """A `json_provider` is prepended to the logits-processor chain (before penalties)."""
+    su = sys.modules["mlx_lm.sample_utils"]
+    monkeypatch.setattr(su, "make_logits_processors", lambda **k: ["PENALTY"])
+
+    def json_proc(_tokens: object, _logits: object) -> object:
+        return _logits
+
+    kw = engine._generation_kwargs(SamplingParams(), json_provider=json_proc)
+    # The same object the caller supplied sits first in the processor chain.
+    assert kw["logits_processors"][0] is json_proc
+    assert kw["logits_processors"][1] == "PENALTY"
+
+
+def test_json_processor_builds_harmony_aware_for_gpt_oss():
+    """For a Harmony tokenizer the processor defers to the final channel."""
+    from omlx._harmony import is_harmony
+
+    class _HarmonyTok:
+        def get_vocab(self):
+            return {"<|call|>": 1}
+
+        def decode(self, ids):
+            return ""
+
+    # Smoke: `_json_processor` returns a callable; harmony behavior is gated
+    # by `is_harmony` and exercised in `tests/test_json.py`.
+    proc = engine._json_processor(_HarmonyTok())
+    assert callable(proc)
+    assert is_harmony(_HarmonyTok())
+
+
+def test_json_processor_builds_non_harmony_for_plain_tokenizer():
+    class _PlainTok:
+        def get_vocab(self):
+            return {"not_harmony": 1}
+
+        def decode(self, ids):
+            return ""
+
+    proc = engine._json_processor(_PlainTok())
+    assert callable(proc)
 
 
 def test_unload_all_clears_resident_set(fake_mlx, make_entry):

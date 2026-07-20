@@ -27,14 +27,38 @@ shape, update those tests intentionally, never by accident.
     (MRU first) added for richer observability. Do not remove or rename either.
   - `GET /api/ps` -> Ollama-shaped `{"models": [{name, model, size, size_vram,
     digest, expires_at}]}` listing resident models (MRU first). `expires_at`
-    is an ISO-8601 UTC instant of `last_used + keepalive_seconds`, or null when
-    `keepalive_seconds < 0` ("keep forever"). Informational, not a hard expiry.
+    is an RFC-3339 UTC instant (`YYYY-MM-DDTHH:MM:SS.ffffffZ`) of
+    `last_used + keepalive_seconds`, or null when `keepalive_seconds < 0`
+    ("keep forever"). Informational, not a hard expiry. All Ollama-shaped
+    timestamps use the `…Z` suffix shape (Ollama parity); `protocol._now_iso`
+    and `server._modified_at` are the only producers.
   - `GET /v1/models` -> OpenAI `{"object": "list", "data": [...]}`
   - `POST /v1/chat/completions` and `POST /v1/completions`, stream + non-stream.
-    Streaming uses OpenAI SSE: `data: {chunk}\n\n` frames, a trailing usage
-    frame, and a terminal `data: [DONE]\n\n`. Errors mid-stream are emitted as
-    `data: {"error": {"message": ..., "type": ...}}` (a 200 stream can't switch
-    to an error status late); non-stream errors return HTTP 500.
+    Streaming uses OpenAI SSE: `data: {chunk}\n\n` frames, a terminal
+    `data: [DONE]\n\n`, and — only when the request sets
+    `stream_options.include_usage: true` — a trailing usage frame with empty
+    choices. Chat streams emit a leading chunk with
+    `delta: {"role": "assistant", "content": ""}` (OpenAI parity); text
+    completions stream bare `text` deltas and no role chunk. Errors mid-stream
+    are emitted as `data: {"error": {"message": ..., "type": ...}}` (a 200
+    stream can't switch to an error status late); non-stream generation
+    failures return HTTP 500.
+  - **Error body shape**: every `/v1/*` and `/api/*` error returns the OpenAI
+    envelope `{"error": {"message", "type", "param", "code"}}` (built by
+    `protocol.openai_error_body`; raised as `protocol.OpenAIError`). FastAPI's
+    `{"detail": ...}` is replaced everywhere — pydantic validation failures
+    return 400 `invalid_request_error/invalid_request`, unknown models 404
+    `not_found_error/model_not_found`, internal failures 500 `internal_error`.
+    Do not re-introduce `HTTPException(detail=...)` for these routes.
+  - **Unknown model = 404, not auto-pull**: generation routes
+    (`/v1/chat/completions`, `/v1/completions`, `/api/chat`, `/api/generate`,
+    `/api/show`, `/api/delete`) call `server._require_known_model` as a
+    preflight and raise `OpenAIError(404, model_not_found)` before any 200
+    streaming response can start. Auto-pull is restricted to `omlx pull` and
+    `/api/pull` — do not reintroduce silent fetching on a typo from a
+    generation route. `engine.ModelManager._resolve` raises `OpenAIError` for
+    unknown models; the preflight is the optimistic path, the engine re-raise
+    is the race-defense path (coverage on both).
   - **Reasoning models (Harmony / gpt-oss)**: the engine parses Harmony output
     (`engine._HarmonyParser`), stripping control tokens and splitting the
     `analysis` channel from `final`. Reasoning rides `reasoning_content` on the
@@ -80,8 +104,19 @@ shape, update those tests intentionally, never by accident.
   - **Sampling** lives under `options` (`num_predict` → `max_tokens`,
     `repeat_penalty` → `repetition_penalty`, plus `temperature`/`top_p`/`top_k`/
     `min_p`/`frequency_penalty`/`presence_penalty`/`stop`/`seed`);
-    `OllamaOptions.to_sampling` maps them. `keep_alive` and `format` are accepted
-    but ignored.
+    `OllamaOptions.to_sampling` maps them. `keep_alive` is accepted but ignored.
+    `format` is honored for the strings `"json"` (enables JSON-object logits
+    masking via `_json.json_object_processor`) and `"text"` (no-op); a dict
+    (schema) or other string is `400 unsupported`.
+  - **JSON mode**: `_SamplingRequest.response_format`
+    (`{"type": "json_object|text|json_schema"}`) and `OllamaOptions`/the
+    request-level `format` field map onto a single JSON-mask logits processor
+    built by `engine._json_processor` from `omlx._json.json_object_processor`.
+    `json_schema` (and Ollama schema dicts) are `400 unsupported`. `tools` and
+    `response_format` are mutually exclusive — sending both is
+    `400 response_format_and_tools_mutually_exclusive`. For Harmony models the
+    mask is channel-aware (applies only inside `final`), re-derived over the body
+    suffix each step so Harmony control tokens never reach the JSON DFA.
   - `POST /api/pull` downloads + registers a model (coarse NDJSON progress: a
     `pulling` frame then `success`; the HF download is blocking).
   - `GET /` returns the literal `Ollama is running` (Ollama liveness probe).
@@ -135,7 +170,12 @@ shape, update those tests intentionally, never by accident.
   (the CLI is usable without Apple Silicon for `list`/`rm`/`daemon status`).
 - **Layering**: HTTP routing lives only in `server.py`; MLX is touched only in
   `engine.py` (and lazily in `pull.py`); `protocol.py` holds the wire shapes and
-  envelope helpers and stays free of routing and MLX. Don't reach across these.
+  envelope helpers and stays free of routing and MLX; `_harmony.py` holds the
+  shared Harmony control-token set and channel detection (imported by
+  `engine.py` for the streaming parser and by `_json.py` for the channel-aware
+  JSON mask); `_json.py` holds the JSON-object logits processor (no routing,
+  no MLX — it imports `mlx.core` lazily inside the processor). Don't reach
+  across these.
 - **Value objects**: `pydantic.BaseModel` for request bodies at the HTTP
   boundary — `@dataclass` for everything internal (`Completion`,
   `SamplingParams`, `LoadedModel`, `ModelEntry`, …). Don't push Pydantic inward.

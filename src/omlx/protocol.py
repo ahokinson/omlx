@@ -120,6 +120,30 @@ def _int_keyed(bias: dict[str, float] | None) -> dict[int, float] | None:
     return out or None
 
 
+class StreamOptions(BaseModel):
+    """OpenAI `stream_options`: streaming-response knobs, currently just usage.
+
+    Per the OpenAI spec, the trailing usage frame is emitted only when
+    ``include_usage`` is true (default off omlx-side as well). Spec-correct
+    clients that want totals must opt in; old omlx behavior emitted it always.
+    """
+
+    include_usage: bool | None = None
+
+
+class ResponseFormat(BaseModel):
+    """OpenAI `response_format` for JSON mode.
+
+    omlx accepts ``{"type": "text"}`` (no-op) and ``{"type": "json_object"}``
+    (constrains generation to a valid JSON value via :mod:`omlx._json`).
+    ``{"type": "json_schema", ...}`` is rejected at the HTTP layer with
+    ``400 unsupported`` (no schema-typed generation in this round).
+    """
+
+    type: str
+    json_schema: dict[str, Any] | None = None
+
+
 class _SamplingRequest(BaseModel):
     """Fields shared by the chat and text completion request bodies."""
 
@@ -149,6 +173,10 @@ class _SamplingRequest(BaseModel):
     stop: str | list[str] | None = None
     seed: int | None = None
     stream: bool = False
+    # OpenAI stream options: when ``include_usage`` is set the trailing usage
+    # frame is emitted; otherwise (spec default) only the terminal finish
+    # chunk and ``[DONE]`` are sent.
+    stream_options: StreamOptions | None = None
 
     def sampling(self) -> SamplingParams:
         return SamplingParams(
@@ -174,10 +202,14 @@ class ChatRequest(_SamplingRequest):
     # is accepted for wire compatibility (advisory to the model).
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
+    # OpenAI JSON-mode: ``json_object`` constrains output to a valid JSON value;
+    # ``json_schema`` is rejected by the HTTP layer with `400 unsupported`.
+    response_format: ResponseFormat | None = None
 
 
 class CompletionRequest(_SamplingRequest):
     prompt: str
+    response_format: ResponseFormat | None = None
 
 
 @dataclass
@@ -282,6 +314,9 @@ class Shape:
 
     ``stream_choice`` emits incremental deltas/text; ``terminal_choice`` emits
     the final non-streaming choice (assistant message or text).
+    ``stream_first_role`` requests a leading chunk with
+    ``delta: {"role": "assistant", "content": ""}`` (OpenAI chat shape only).
+    Text completions have no role delta.
     """
 
     rid_prefix: str
@@ -289,6 +324,7 @@ class Shape:
     nonstream_obj: str
     stream_choice: ChoiceBuilder
     terminal_choice: ChoiceBuilder
+    stream_first_role: bool = False
 
 
 CHAT_SHAPE = Shape(
@@ -297,6 +333,7 @@ CHAT_SHAPE = Shape(
     nonstream_obj="chat.completion",
     stream_choice=_chat_choice,
     terminal_choice=_chat_message_choice,
+    stream_first_role=True,
 )
 COMPLETION_SHAPE = Shape(
     rid_prefix="cmpl",
@@ -304,6 +341,7 @@ COMPLETION_SHAPE = Shape(
     nonstream_obj="text_completion",
     stream_choice=_text_choice,
     terminal_choice=_text_choice,
+    stream_first_role=False,
 )
 
 
@@ -326,8 +364,20 @@ def sse_response(
     model: str,
     obj: str,
     choice: ChoiceBuilder,
+    include_usage: bool = False,
+    first_chunk_role: bool = False,
 ) -> StreamingResponse:
-    """Stream `chunks` as OpenAI SSE frames + a terminal choice, usage, [DONE].
+    """Stream `chunks` as OpenAI SSE frames + a terminal choice, optional usage, [DONE].
+
+    OpenAI streaming parity:
+    - When ``first_chunk_role`` is set, a leading chunk carries
+      ``delta: {"role": "assistant", "content": ""}`` (chat shape only).
+    - The trailing usage frame (empty choices, ``usage`` populated) is emitted
+      only when ``include_usage`` is set, per the OpenAI spec default. Older
+      omlx behavior emitted it always — opt back in with
+      ``stream_options.include_usage``.
+    - A terminal finish chunk (``delta: {}`` + ``finish_reason``) is always
+      emitted, then ``data: [DONE]\\n\\n``.
 
     Errors raised by the generator are emitted in-band as
     `data: {"error": ...}` since once a 200 stream has started we can no
@@ -350,6 +400,15 @@ def sse_response(
 
     def gen() -> Iterator[str]:
         try:
+            if first_chunk_role:
+                # OpenAI chat: first chunk carries the assistant role before any
+                # content / reasoning / tool_calls flow.
+                role_choice: dict[str, Any] = {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": None,
+                }
+                yield _sse(envelope([role_choice], None))
             final: Completion | None = None
             tc_index = 0  # running index across all streamed tool_calls
             for chunk in chunks:
@@ -365,8 +424,9 @@ def sse_response(
                     final = chunk
             finish = final.finish_reason if final else "stop"
             yield _sse(envelope([choice("", finish)], None))
-            # Spec-shaped trailing usage frame (choices empty, usage populated).
-            yield _sse(envelope([], usage(final)))
+            # Spec-shaped trailing usage frame only when the client opted in.
+            if include_usage:
+                yield _sse(envelope([], usage(final)))
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield _sse({"error": {"message": str(e), "type": type(e).__name__}})
@@ -520,12 +580,62 @@ class OllamaPullRequest(BaseModel):
 
 
 def _now_iso() -> str:
-    """Current UTC instant as an ISO-8601 string for Ollama `created_at`."""
-    return datetime.now(timezone.utc).isoformat()
+    """Current UTC instant as an RFC-3339 string for Ollama `created_at`.
+
+    Ollama emits ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` (UTC, fractional seconds, ``Z``
+    suffix); matching that shape byte-for-byte keeps strict clients happy.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _ndjson(payload: dict[str, Any]) -> str:
     return f"{json.dumps(payload)}\n"
+
+
+# OpenAI error envelope (`{"error": {"message","type","param","code"}}); the spec
+# shape returned on every `/v1/*` and `/api/*` error. `server.py` registers FastAPI
+# exception handlers that build this via `openai_error`, so non-stream failures no
+# longer leak FastAPI's default `{"detail": ...}` shape to OpenAI clients.
+class OpenAIError(Exception):
+    """Raised anywhere in the stack to surface a structured OpenAI-shaped error.
+
+    Carries the HTTP status, the OpenAI error `type` (e.g. ``invalid_request_error``,
+    ``not_found_error``, ``internal_error``), a short snake_case ``code``
+    (e.g. ``model_not_found``, ``unsupported``), the offending ``param`` if any,
+    and the human-readable ``message``. ``server.py``'s exception handler turns
+    this into the wire body; other exceptions fall through to a generic 500 with
+    ``type=internal_error``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 500,
+        type: str = "internal_error",  # noqa: A002 - mirrors the OpenAI field name
+        code: str | None = None,
+        param: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.type = type
+        self.code = code
+        self.param = param
+
+
+def openai_error_body(
+    message: str,
+    *,
+    type: str = "internal_error",  # noqa: A002
+    code: str | None = None,
+    param: str | None = None,
+) -> dict[str, Any]:
+    """Build the OpenAI error object carried under the top-level ``error`` key."""
+    err: dict[str, Any] = {"message": message, "type": type, "param": param}
+    if code is not None:
+        err["code"] = code
+    return {"error": err}
 
 
 def _ollama_stats(final: Completion | None, started_ns: int) -> dict[str, int]:

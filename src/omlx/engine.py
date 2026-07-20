@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import threading
 import time
 import uuid
@@ -16,8 +15,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import config, registry
+from ._harmony import HARMONY_CONTROL, REASONING_CHANNELS, harmony_tool_name, is_harmony
 from .config import settings
-from .protocol import Completion, SamplingParams
+from .protocol import Completion, OpenAIError, SamplingParams
 
 logger = logging.getLogger("omlx")
 
@@ -109,15 +109,21 @@ class ModelManager:
     def _resolve(self, name: str) -> str:
         """Map a friendly name / repo id to something mlx_lm.load accepts.
 
-        Known models load from their recorded path/repo; unknown names are
-        auto-pulled, then loaded.
+        Known models load from their recorded path/repo; unknown names raise
+        ``OpenAIError(404, model_not_found)``. Auto-pull is intentionally
+        restricted to ``omlx pull`` and ``/api/pull`` so a typo on a generation
+        route doesn't silently fetch a multi-GB repo.
         """
         entry = registry.get(name)
-        if entry is not None:
-            return entry.repo_id
-        from .pull import pull
-
-        return pull(name).repo_id
+        if entry is None:
+            raise OpenAIError(
+                f"model {name!r} not found",
+                status=404,
+                type="not_found_error",
+                code="model_not_found",
+                param="model",
+            )
+        return entry.repo_id
 
     def _resident_bytes_locked(self) -> int:
         return sum(lm.size_bytes for lm in self._loaded.values())
@@ -255,6 +261,7 @@ class ModelManager:
         messages: list[dict[str, Any]],
         params: SamplingParams | None = None,
         tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> Iterator[Completion]:
         """Stream generated tokens for `messages` via the model's chat template.
 
@@ -262,20 +269,30 @@ class ModelManager:
         from the final answer and control tokens are stripped. Inert for
         non-reasoning models. When `tools` is given and the tokenizer supports
         tool calling, tools are offered to the template and tool-call spans in
-        the output are parsed into OpenAI `tool_calls`.
+        the output are parsed into OpenAI `tool_calls`. When `response_format`
+        carries ``{"type": "json_object"}`` (already validated by the HTTP
+        layer) a JSON-mask logits processor is added to constrain output to a
+        valid JSON value (Harmony-channel-aware; see :mod:`omlx._json`).
         """
         lm = self.get(name)
         tok = lm.tokenizer
         # gpt-oss reports no `has_tool_calling` (Harmony has no mlx-lm tool parser);
         # its calls are parsed from the commentary channel in `_parse_harmony`.
         generic_tools = bool(tools) and getattr(tok, "has_tool_calling", False)
-        offer_tools = bool(tools) and (generic_tools or _is_harmony(tok))
+        offer_tools = bool(tools) and (generic_tools or is_harmony(tok))
         template_kwargs: dict[str, Any] = {"add_generation_prompt": True, "tokenize": False}
         if offer_tools:
             template_kwargs["tools"] = tools
         prompt = tok.apply_chat_template(messages, **template_kwargs)
+        json_mode = bool(response_format and response_format.get("type") == "json_object")
         stream = _parse_harmony(
-            self._stream_prompt(lm, prompt, params or SamplingParams(), use_cache=True)
+            self._stream_prompt(
+                lm,
+                prompt,
+                params or SamplingParams(),
+                use_cache=True,
+                json_provider=_json_processor(tok) if json_mode else None,
+            )
         )
         if generic_tools:
             stream = _parse_tool_calls(
@@ -288,21 +305,42 @@ class ModelManager:
         yield from stream
 
     def stream_text(
-        self, name: str, prompt: str, params: SamplingParams | None = None
+        self,
+        name: str,
+        prompt: str,
+        params: SamplingParams | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> Iterator[Completion]:
-        """Stream generated tokens for a raw `prompt` (no chat template)."""
+        """Stream generated tokens for a raw `prompt` (no chat template).
+
+        ``response_format`` mirrors :meth:`stream_chat`: a dict with
+        ``"type": "json_object"`` activates the JSON-mask logits processor.
+        """
         lm = self.get(name)
-        yield from self._stream_prompt(lm, prompt, params or SamplingParams())
+        json_mode = bool(response_format and response_format.get("type") == "json_object")
+        yield from self._stream_prompt(
+            lm,
+            prompt,
+            params or SamplingParams(),
+            json_provider=_json_processor(lm.tokenizer) if json_mode else None,
+        )
 
     def _stream_prompt(
-        self, lm: LoadedModel, prompt: str, params: SamplingParams, use_cache: bool = False
+        self,
+        lm: LoadedModel,
+        prompt: str,
+        params: SamplingParams,
+        use_cache: bool = False,
+        json_provider: Callable[[Any, Any], Any] | None = None,
     ) -> Iterator[Completion]:
         """Stream a prompt, optionally reusing/extending the model's KV prompt cache.
 
         With `use_cache`, only the suffix of `prompt` that diverges from the
         cached prefix is prefilled; `mlx-lm` reports `prompt_tokens` for that
         suffix only, so the reused-prefix length is added back to keep the usage
-        count the full prompt size.
+        count the full prompt size. ``json_provider``, when supplied, is
+        prepended to the logits-processor chain (before the penalty processors)
+        to constrain output to valid JSON.
         """
         from mlx_lm import stream_generate
 
@@ -310,7 +348,7 @@ class ModelManager:
             import mlx.core as mx  # ty: ignore[unresolved-import]
 
             mx.random.seed(params.seed)
-        kwargs = _generation_kwargs(params)
+        kwargs = _generation_kwargs(params, json_provider=json_provider)
         prompt_arg, offset, cache, tokens = self._prepare_cache(lm, prompt, use_cache)
         if cache is not None:
             kwargs["prompt_cache"] = cache
@@ -478,13 +516,20 @@ def _with_offset(comp: Completion, offset: int) -> Completion:
     return comp
 
 
-def _generation_kwargs(params: SamplingParams) -> dict[str, Any]:
+def _generation_kwargs(
+    params: SamplingParams,
+    *,
+    json_provider: Callable[[Any, Any], Any] | None = None,
+) -> dict[str, Any]:
     """Sampler, logits processors, and KV-cache options for `stream_generate`.
 
     Non-default sampling fields (`top_k`, `min_p`, the penalties, `logit_bias`)
     are honored here; `make_logits_processors` no-ops on zero/None so the
-    processor list is None unless a penalty or bias was requested. KV-cache
-    quantization is server-wide (`OMLX_KV_BITS`), applied only when set.
+    processor list is empty unless a penalty or bias was requested. When a
+    ``json_provider`` is supplied (from a JSON-mode request), it's prepended
+    to the processor chain so structural masking runs before estimator
+    penalties. KV-cache quantization is server-wide (`OMLX_KV_BITS`),
+    applied only when set.
     """
     from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
@@ -500,12 +545,28 @@ def _generation_kwargs(params: SamplingParams) -> dict[str, Any]:
         presence_penalty=params.presence_penalty,
         frequency_penalty=params.frequency_penalty,
     )
+    if json_provider is not None:
+        # JSON mask first: structural constraint must dominate over estimator
+        # penalties that might otherwise nudge the model off-grammar.
+        processors = [json_provider] + list(processors or [])
     kwargs: dict[str, Any] = {"sampler": sampler, "logits_processors": processors or None}
     if settings.kv_bits is not None:
         kwargs["kv_bits"] = settings.kv_bits
         kwargs["kv_group_size"] = settings.kv_group_size
         kwargs["quantized_kv_start"] = settings.quantized_kv_start
     return kwargs
+
+
+def _json_processor(tokenizer: Any) -> Callable[[Any, Any], Any]:
+    """Build a JSON-mode logits processor for a tokenizer.
+
+    Detects whether the tokenizer speaks Harmony (gpt-oss) via the shared vocab
+    probe; if so, the processor is channel-aware (applies only inside
+    ``final``); otherwise it constrains output from the very first token.
+    """
+    from ._json import json_object_processor
+
+    return json_object_processor(tokenizer, harmony=is_harmony(tokenizer))
 
 
 def _earliest_stop(text: str, stops: tuple[str, ...]) -> int | None:
@@ -556,41 +617,9 @@ def _stream_with_stops(gen: Iterator[Any], stops: tuple[str, ...]) -> Iterator[C
         )
 
 
-# OpenAI Harmony control tokens (gpt-oss and friends). Stripped from output.
-_HARMONY_CONTROL = (
-    "<|start|>",
-    "<|end|>",
-    "<|message|>",
-    "<|channel|>",
-    "<|constrain|>",
-    "<|return|>",
-    "<|call|>",
-)
-# Channels whose body is chain-of-thought (routed to `reasoning`); anything
-# else (`final`, or an unlabeled body) is the answer (routed to `text`).
-_REASONING_CHANNELS = ("analysis", "commentary")
-
-# A Harmony tool call rides the commentary channel with a `to=functions.NAME`
-# recipient, e.g. `<|channel|>commentary to=functions.get_weather<|message|>`.
-_HARMONY_TOOL_RE = re.compile(r"to=functions\.([\w.-]+)")
-
-
-def _harmony_tool_name(channel: str) -> str | None:
-    """The function name if `channel` is a `to=functions.NAME` tool header, else None."""
-    m = _HARMONY_TOOL_RE.search(channel)
-    return m.group(1) if m else None
-
-
-def _is_harmony(tok: Any) -> bool:
-    """True when the tokenizer speaks Harmony (gpt-oss), by probing its vocab.
-
-    gpt-oss reports no `has_tool_calling`, so this is the pre-generation signal
-    for whether to offer tools to the chat template.
-    """
-    try:
-        return "<|call|>" in tok.get_vocab()
-    except Exception:
-        return False
+# Harmony control tokens / channel detection live in `_harmony.py` (shared
+# with `_json.py` for Harmony-aware JSON-mode masking). The parser below
+# references them via the imports at the top of this module.
 
 
 class _HarmonyParser:
@@ -662,12 +691,12 @@ class _HarmonyParser:
             self._state, self._channel = self._CHANNEL, ""
         elif tok == "<|message|>":
             self._state = self._TEXT
-            name = _harmony_tool_name(self._channel)
+            name = harmony_tool_name(self._channel)
             if name is not None:
                 self._tool_active, self._tool_name, self._tool_args = True, name, []
                 self._to_reasoning = False
             else:
-                self._to_reasoning = self._channel.strip() in _REASONING_CHANNELS
+                self._to_reasoning = self._channel.strip() in REASONING_CHANNELS
         elif tok in ("<|start|>", "<|constrain|>"):
             self._state = self._ROLE  # suppress the role / constraint header
         else:  # <|end|>, <|return|>, <|call|> — close the body, await next header
@@ -676,14 +705,14 @@ class _HarmonyParser:
             self._state, self._channel = self._ROLE, ""
 
     def _match(self, i: int) -> str | None:
-        for tok in _HARMONY_CONTROL:
+        for tok in HARMONY_CONTROL:
             if self._buf.startswith(tok, i):
                 return tok
         return None
 
     def _is_partial(self, i: int) -> bool:
         frag = self._buf[i:]
-        return any(tok.startswith(frag) for tok in _HARMONY_CONTROL)
+        return any(tok.startswith(frag) for tok in HARMONY_CONTROL)
 
     def _scan(self, final: bool) -> tuple[str, str, list[dict[str, Any]]]:
         content: list[str] = []

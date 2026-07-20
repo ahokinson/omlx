@@ -34,6 +34,7 @@ class FakeManager:
         self.seen_messages = None  # last messages passed to stream_chat
         self.seen_tools = None  # last tools passed to stream_chat
         self.seen_sampling = None  # last SamplingParams passed to stream_chat
+        self.seen_response_format = None  # last response_format dict passed to stream_chat/text
 
     def loaded(self):
         return "Llama" if not self.raises else None
@@ -71,13 +72,15 @@ class FakeManager:
                 tool_calls=tuple(self.tool_calls) if (self.tool_calls and i == last) else (),
             )
 
-    def stream_chat(self, name, messages, *a, tools=None, **k):
+    def stream_chat(self, name, messages, *a, tools=None, response_format=None, **k):
         self.seen_messages = messages
         self.seen_tools = tools
         self.seen_sampling = a[0] if a else None
+        self.seen_response_format = response_format
         return self._gen()
 
-    def stream_text(self, *a, **k):
+    def stream_text(self, *a, response_format=None, **k):
+        self.seen_response_format = response_format
         return self._gen()
 
 
@@ -96,10 +99,17 @@ def _usage_frame(frames):
 
 
 @pytest.fixture
-def make_client(monkeypatch):
-    """Factory: install a (possibly failing) FakeManager and return a client."""
+def make_client(monkeypatch, make_entry):
+    """Factory: install a (possibly failing) FakeManager and return a client.
 
-    def _make(**kw):
+    The "Llama" model is pre-registered by default so the unknown-model preflight
+    passes for generation routes; pass ``register=False`` to keep the registry
+    empty (used by tests asserting on empty-listing shapes).
+    """
+
+    def _make(*, register: bool = True, **kw):
+        if register:
+            registry.add(make_entry(name="Llama", repo_id="org/Llama"))
         monkeypatch.setattr(server, "MANAGER", FakeManager(**kw))
         return TestClient(server.app)
 
@@ -157,8 +167,8 @@ def test_api_tags(client, make_entry):
     assert isinstance(model["modified_at"], str) and "T" in model["modified_at"]
 
 
-def test_api_tags_empty(client):
-    assert client.get("/api/tags").json() == {"models": []}
+def test_api_tags_empty(make_client):
+    assert make_client(register=False).get("/api/tags").json() == {"models": []}
 
 
 def test_api_show(client, make_entry, tmp_path):
@@ -261,13 +271,81 @@ def test_chat_accepts_stop_and_seed(client):
 def test_chat_stream_sse_framing(client):
     r = client.post(
         "/v1/chat/completions",
-        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
     )
     assert r.status_code == 200
     frames = _sse_frames(r.text)
     deltas = [f["choices"][0]["delta"].get("content", "") for f in frames if f["choices"]]
     assert "".join(deltas) == "hello"
+    # The assistant-role first chunk contributes an empty content string; the
+    # subsequent content chunks carry "hel" and "lo".
+    assert deltas[0] == ""
     assert _usage_frame(frames)["usage"]["total_tokens"] == 7
+
+
+def test_chat_stream_first_chunk_carries_assistant_role(client):
+    """OpenAI spec: a chat stream's first chunk has a role-only delta."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert r.status_code == 200
+    frames = _sse_frames(r.text)
+    first = frames[0]
+    assert first["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    assert first["choices"][0]["finish_reason"] is None
+
+
+def test_chat_stream_usage_omitted_by_default(client):
+    """Spec default: no usage frame unless `stream_options.include_usage` is set."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    frames = _sse_frames(r.text)
+    assert not any("usage" in f for f in frames)
+
+
+def test_chat_stream_include_usage_false_suppresses_frame(client):
+    """An explicit ``{"include_usage": false}`` matches the default behavior."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stream_options": {"include_usage": False},
+        },
+    )
+    frames = _sse_frames(r.text)
+    assert not any("usage" in f for f in frames)
+
+
+def test_completion_stream_has_no_role_chunk(client):
+    """Text completions stream bare `text` deltas; no assistant role chunk."""
+    r = client.post(
+        "/v1/completions",
+        json={"model": "Llama", "prompt": "hi", "stream": True},
+    )
+    assert r.status_code == 200
+    frames = _sse_frames(r.text)
+    # No role delta on any chunk of a text completion stream.
+    assert all("role" not in f["choices"][0] for f in frames if f["choices"])
+
+
+def test_completion_stream_usage_omitted_by_default(client):
+    """Same `include_usage` default applies to text completions."""
+    r = client.post(
+        "/v1/completions",
+        json={"model": "Llama", "prompt": "hi", "stream": True},
+    )
+    frames = _sse_frames(r.text)
+    assert not any("usage" in f for f in frames)
 
 
 def test_chat_non_stream_includes_reasoning_content(make_client):
@@ -493,7 +571,15 @@ def test_completions_non_stream(client):
 
 
 def test_completions_stream_sse_framing(client):
-    r = client.post("/v1/completions", json={"model": "Llama", "prompt": "hi", "stream": True})
+    r = client.post(
+        "/v1/completions",
+        json={
+            "model": "Llama",
+            "prompt": "hi",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
     assert r.status_code == 200
     frames = _sse_frames(r.text)
     texts = [f["choices"][0].get("text", "") for f in frames if f["choices"]]
@@ -795,3 +881,472 @@ def test_api_pull_error_returns_500(client, monkeypatch):
     monkeypatch.setattr("omlx.pull.pull", boom)
     r = client.post("/api/pull", json={"model": "org/Repo", "stream": False})
     assert r.status_code == 500
+
+
+# --- Bundle 1: OpenAI error envelope, unknown-model 404, RFC-3339 timestamps ---
+
+
+def test_unknown_model_returns_404_openai_error_body(make_client):
+    """Unknown model on a generation route surfaces as 404 with the OpenAI shape."""
+    tc = make_client(register=False)  # no models in the registry
+    r = tc.post(
+        "/v1/chat/completions",
+        json={"model": "ghost", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 404
+    body = r.json()
+    assert body["error"]["type"] == "not_found_error"
+    assert body["error"]["code"] == "model_not_found"
+    assert body["error"]["param"] == "model"
+    assert "ghost" in body["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "ghost", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        ("/v1/completions", {"model": "ghost", "prompt": "hi"}),
+        (
+            "/api/chat",
+            {"model": "ghost", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        ("/api/generate", {"model": "ghost", "prompt": "hi"}),
+    ],
+)
+def test_unknown_model_returns_404_on_every_generation_route(make_client, path, body):
+    """All four generation routes surface unknown-model as 404, preflight-time."""
+    tc = make_client(register=False)
+    r = tc.post(path, json=body)
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "model": "ghost",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ),
+        (
+            "/api/chat",
+            {"model": "ghost", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+    ],
+)
+def test_unknown_model_stream_returns_404(make_client, path, body):
+    """A streaming request for an unknown model returns 404 (no in-band error frame)."""
+    tc = make_client(register=False)
+    r = tc.post(path, json=body)
+    assert r.status_code == 404
+    assert "[DONE]" not in r.text  # never started streaming
+    assert r.json()["error"]["code"] == "model_not_found"
+
+
+def test_unknown_model_in_api_show_returns_404_openai_body(make_client):
+    tc = make_client(register=False)
+    r = tc.post("/api/show", json={"model": "ghost"})
+    assert r.status_code == 404
+    body = r.json()
+    assert body["error"]["type"] == "not_found_error"
+    assert body["error"]["code"] == "model_not_found"
+
+
+def test_unknown_model_in_api_delete_returns_404_openai_body(make_client):
+    tc = make_client(register=False)
+    r = tc.request("DELETE", "/api/delete", json={"model": "ghost"})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        # Missing required `messages` on chat.
+        ("/v1/chat/completions", {"model": "Llama"}),
+        # Missing required `prompt` on completions.
+        ("/v1/completions", {"model": "Llama"}),
+    ],
+)
+def test_malformed_request_returns_400_openai_body(make_client, path, body):
+    """Pydantic validation failures render as the OpenAI error envelope (400)."""
+    tc = make_client()
+    r = tc.post(path, json=body)
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "invalid_request"
+
+
+def test_internal_error_returns_500_openai_body(make_client):
+    """Generation failures return 500 with the OpenAI error envelope (pinned).
+
+    Downgraded from FastAPI's `{"detail": ...}` to the spec shape; status and
+    pinned test contract preserved.
+    """
+    tc = make_client(raises=True)
+    r = tc.post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 500
+    err = r.json()["error"]
+    assert err["type"] == "internal_error"
+    assert "boom" in err["message"]
+
+
+def test_api_chat_non_stream_internal_error_returns_500_openai_body(make_client):
+    tc = make_client(raises=True)
+    r = tc.post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+    )
+    assert r.status_code == 500
+    assert r.json()["error"]["type"] == "internal_error"
+
+
+def test_api_generate_non_stream_internal_error_returns_500_openai_body(make_client):
+    tc = make_client(raises=True)
+    r = tc.post("/api/generate", json={"model": "Llama", "prompt": "hi", "stream": False})
+    assert r.status_code == 500
+    assert r.json()["error"]["type"] == "internal_error"
+
+
+def test_api_pull_error_returns_500_openai_body(make_client, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("no such repo")
+
+    monkeypatch.setattr("omlx.pull.pull", boom)
+    tc = make_client()
+    r = tc.post("/api/pull", json={"model": "org/Repo", "stream": False})
+    assert r.status_code == 500
+    assert r.json()["error"]["type"] == "internal_error"
+
+
+def test_timestamps_use_rfc3339_z_suffix(make_client):
+    """Ollama-shaped timestamps carry fractional seconds and a `Z` suffix."""
+    from datetime import datetime
+
+    tc = make_client()
+    r = tc.post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+    )
+    created_at = r.json()["created_at"]
+    # RFC-3339 with microseconds and a literal `Z` (no `+00:00`).
+    assert created_at.endswith("Z")
+    assert "." in created_at  # fractional seconds present
+    # Round-trip parse: drop the Z, parse as naive UTC, succeeds.
+    datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+
+
+def test_api_tags_modified_at_uses_rfc3339_z_suffix(client, make_entry):
+    from datetime import datetime
+
+    registry.add(make_entry(name="Llama2", repo_id="org/Llama2", quant="4bit"))
+    model = client.get("/api/tags").json()["models"][0]
+    modified_at = model["modified_at"]
+    assert modified_at.endswith("Z")
+    assert "." in modified_at
+    datetime.fromisoformat(modified_at.replace("Z", "+00:00"))
+
+
+def test_openai_error_body_shape():
+    """The error-object builder emits the spec fields in spec order."""
+    from omlx.protocol import openai_error_body
+
+    body = openai_error_body(
+        "boom", type="invalid_request_error", code="bad_value", param="temperature"
+    )
+    assert body == {
+        "error": {
+            "message": "boom",
+            "type": "invalid_request_error",
+            "param": "temperature",
+            "code": "bad_value",
+        }
+    }
+    # `code` is optional and omitted when not provided (per OpenAI spec).
+    assert "code" not in openai_error_body("x", type="internal_error")["error"]
+
+
+def test_openai_error_carries_status_and_codes():
+    from omlx.protocol import OpenAIError
+
+    e = OpenAIError(
+        "nope",
+        status=404,
+        type="not_found_error",
+        code="model_not_found",
+        param="model",
+    )
+    assert e.status == 404
+    assert e.type == "not_found_error" and e.code == "model_not_found"
+    assert e.param == "model"
+    assert str(e) == "nope"
+
+
+# --- Bundle 3: response_format / Ollama `format` (JSON mode) ------------------
+
+
+def test_chat_response_format_json_object_forwards_to_engine(client):
+    """A `json_object` request reaches `stream_chat` with the response_format dict."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "give a JSON example"}],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert r.status_code == 200
+    rf = server.MANAGER.seen_response_format
+    assert rf == {"type": "json_object", "json_schema": None}
+
+
+def test_completions_response_format_json_object_forwards_to_engine(client):
+    r = client.post(
+        "/v1/completions",
+        json={
+            "model": "Llama",
+            "prompt": "give a JSON example",
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert r.status_code == 200
+    assert server.MANAGER.seen_response_format == {"type": "json_object", "json_schema": None}
+
+
+def test_chat_response_format_text_is_a_no_op(client):
+    """`{"type":"text"}` is OpenAI's pass-through: the engine gets None (no mask)."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "text"},
+        },
+    )
+    assert r.status_code == 200
+    assert server.MANAGER.seen_response_format is None
+
+
+def test_chat_response_format_json_schema_returns_400_unsupported(make_client):
+    tc = make_client()
+    r = tc.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "x"}},
+        },
+    )
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "unsupported"
+    assert err["param"] == "response_format"
+    assert server.MANAGER.seen_response_format is None  # never reached the engine
+
+
+def test_chat_response_format_and_tools_returns_400_mutually_exclusive(make_client):
+    tc = make_client()
+    r = tc.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "weather in SF?"}],
+            "response_format": {"type": "json_object"},
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+        },
+    )
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["code"] == "response_format_and_tools_mutually_exclusive"
+    assert err["param"] == "response_format"
+
+
+def test_api_chat_format_json_forwards_to_engine(client):
+    """Ollama `format: "json"` maps to `ResponseFormat(type="json_object")`."""
+    r = client.post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "give a JSON example"}],
+            "format": "json",
+            "stream": False,
+        },
+    )
+    assert r.status_code == 200
+    assert server.MANAGER.seen_response_format == {"type": "json_object", "json_schema": None}
+
+
+def test_api_generate_format_json_routes_to_json_mode(client):
+    client.post(
+        "/api/generate",
+        json={
+            "model": "Llama",
+            "prompt": "give a JSON example",
+            "format": "json",
+            "stream": False,
+        },
+    )
+    assert server.MANAGER.seen_response_format == {"type": "json_object", "json_schema": None}
+
+
+def test_api_chat_format_schema_dict_returns_400_unsupported(make_client):
+    tc = make_client()
+    r = tc.post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "format": {"type": "object", "properties": {}},
+            "stream": False,
+        },
+    )
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["code"] == "unsupported"
+    assert err["param"] == "format"
+
+
+def test_api_chat_format_and_tools_returns_400_mutually_exclusive(make_client):
+    tc = make_client()
+    r = tc.post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "weather in SF?"}],
+            "format": "json",
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+        },
+    )
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["code"] == "response_format_and_tools_mutually_exclusive"
+    assert err["param"] == "format"
+
+
+def test_api_generate_format_text_is_a_no_op(client):
+    r = client.post(
+        "/api/generate",
+        json={
+            "model": "Llama",
+            "prompt": "hi",
+            "format": "text",
+            "stream": False,
+        },
+    )
+    assert r.status_code == 200
+    assert server.MANAGER.seen_response_format is None
+
+
+def test_api_chat_format_unknown_string_returns_400(make_client):
+    tc = make_client()
+    r = tc.post(
+        "/api/chat",
+        json={
+            "model": "Llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "format": "yaml",
+            "stream": False,
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "unsupported"
+
+
+def test_unhandled_exception_returns_500_openai_body(make_client, monkeypatch):
+    """An exception that escapes a route (no local try/except) hits the catchall
+    and surfaces as a 500 internal_error with the OpenAI envelope."""
+    from fastapi.testclient import TestClient
+
+    from omlx import registry as reg
+    from omlx import server as srv
+
+    def boom():
+        raise RuntimeError("registry corrupted")
+
+    monkeypatch.setattr(reg, "entries", boom)
+    # `raise_server_exceptions=False` lets the registered handler produce the
+    # 500 response instead of TestClient re-raising the underlying error.
+    make_client()
+    tc = TestClient(srv.app, raise_server_exceptions=False)
+    r = tc.get("/api/tags")
+    assert r.status_code == 500
+    assert r.json()["error"]["type"] == "internal_error"
+
+
+def test_registry_vanished_between_preflight_and_load_returns_404(make_client, monkeypatch):
+    """Defensive `except OpenAIError: raise` in `_complete` re-raises when an
+    OpenAIError leaks past the preflight (a registry-race where the entry is
+    removed between the preflight and the engine's `get()`).
+    """
+    from omlx.protocol import OpenAIError
+
+    class _RaceyManager(FakeManager):
+        # Preflight passes (registry has Llama); the generator raises anyway.
+        def _gen(self):
+            raise OpenAIError(
+                "model 'Llama' not found",
+                status=404,
+                type="not_found_error",
+                code="model_not_found",
+                param="model",
+            )
+            yield  # make this a generator
+
+    tc = make_client()
+    monkeypatch.setattr(server, "MANAGER", _RaceyManager())
+    r = tc.post(
+        "/v1/chat/completions",
+        json={"model": "Llama", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
+
+
+@pytest.mark.parametrize("route", ["/api/chat", "/api/generate"])
+def test_api_routes_reraise_openai_error_past_preflight(make_client, monkeypatch, route):
+    """Same race-defense on the Ollama routes: a post-preflight `OpenAIError`
+    must surface as 404, not a 500 in-band NDJSON error line.
+    """
+    from omlx.protocol import OpenAIError
+
+    class _RaceyManager(FakeManager):
+        def _gen(self):
+            raise OpenAIError(
+                "model 'Llama' not found",
+                status=404,
+                type="not_found_error",
+                code="model_not_found",
+                param="model",
+            )
+            yield
+
+    tc = make_client()
+    monkeypatch.setattr(server, "MANAGER", _RaceyManager())
+    body = (
+        {"model": "Llama", "messages": [{"role": "user", "content": "hi"}], "stream": False}
+        if route == "/api/chat"
+        else {"model": "Llama", "prompt": "hi", "stream": False}
+    )
+    r = tc.post(route, json=body)
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
