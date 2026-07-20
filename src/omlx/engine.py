@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from . import config, registry
@@ -291,6 +292,7 @@ class ModelManager:
             # load() returns (model, tokenizer), plus a config when return_config
             # is set; star-unpack tolerates either arity.
             model, tokenizer, *_ = load(source)
+            _augment_eos(tokenizer, entry.path if entry else None)
             return model, tokenizer
 
         model, tokenizer = _run(_load)
@@ -406,7 +408,7 @@ class ModelManager:
             self._stream_prompt(
                 lm,
                 prompt,
-                params or SamplingParams(),
+                _with_chat_stop(params or SamplingParams(), tok),
                 use_cache=True,
                 json_provider=_json_processor(tok) if json_mode else None,
             )
@@ -609,6 +611,77 @@ class ModelManager:
 
 
 MANAGER = ModelManager()
+
+
+def _augment_eos(tok: Any, model_dir: str | None) -> None:
+    """Register the model's real turn terminator(s) in mlx-lm's eos set.
+
+    mlx-lm seeds `eos_token_ids` from the model config's numeric `eos_token_id`
+    (`config.json`, overridden by `generation_config.json`) and drops the
+    tokenizer's own declared eos when the two disagree. ChatML and Llama-3
+    conversions whose numeric eos points at a token the chat template never emits
+    then never stop: `stream_generate` runs on, the true terminator (e.g.
+    `<|im_end|>`) is decoded into the output as literal text, and the model
+    free-runs a new turn until `max_tokens`. Sources are unioned in from most to
+    least authoritative.
+    """
+    add = getattr(tok, "add_eos_token", None)
+    if not callable(add):
+        return
+
+    def _add(token: Any) -> None:
+        try:
+            add(token)
+        except Exception as e:
+            logger.debug("could not register eos %r: %s", token, e)
+
+    # 1. tokenizer's declared eos string (tokenizer_config / special_tokens_map).
+    eot = getattr(tok, "eos_token", None)
+    if eot:
+        _add(eot)
+    # 2. generation_config.json eos_token_id (int or list), HF's generation-time
+    #    eos source.
+    if model_dir:
+        gc = Path(model_dir) / "generation_config.json"
+        try:
+            if gc.exists():
+                ids = json.loads(gc.read_text()).get("eos_token_id")
+                for i in [ids] if isinstance(ids, int) else (ids or []):
+                    _add(int(i))
+        except Exception as e:
+            logger.debug("generation_config eos read failed: %s", e)
+    # 3. well-known chat terminators present in this vocab. Skipped for Harmony:
+    #    `<|end|>` there is a channel separator, not a turn end, so registering it
+    #    as eos would halt generation after the analysis channel.
+    if is_harmony(tok):
+        return
+    to_id = getattr(tok, "convert_tokens_to_ids", None)
+    if not callable(to_id):
+        return
+    unk = getattr(tok, "unk_token_id", None)
+    for t in ("<|im_end|>", "<|eot_id|>", "<|end|>"):
+        try:
+            tid = to_id(t)
+        except Exception:
+            continue
+        if isinstance(tid, int) and tid != unk:
+            _add(tid)
+
+
+def _with_chat_stop(params: SamplingParams, tok: Any) -> SamplingParams:
+    """Add the tokenizer's turn terminator to `stop` as a text-level backstop.
+
+    Complements :func:`_augment_eos`: if a terminator's id still isn't honored at
+    the token level, its string form truncates the response here. Skipped for
+    Harmony models, whose `eos_token` may be a mid-stream channel separator, and
+    when the terminator is already among the client's stop strings.
+    """
+    if is_harmony(tok):
+        return params
+    eot = getattr(tok, "eos_token", None)
+    if not eot or eot in params.stop:
+        return params
+    return replace(params, stop=params.stop + (eot,))
 
 
 def _encode_prompt(tok: Any, prompt: str) -> list[int]:

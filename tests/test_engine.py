@@ -1138,3 +1138,115 @@ def test_evict_to_count_skipped_when_all_resident_is_active(fake_mlx, make_entry
     # for a guest that we explicitly requested → resident grows past the count cap.
     assert c.name == "C"
     assert len(mgr._loaded) == 3
+
+
+class EosTokenizer:
+    """Tokenizer fake exposing mlx-lm's eos-registration surface."""
+
+    def __init__(self, vocab=None, eos_token=None, harmony=False):
+        self._vocab = dict(vocab or {})
+        if harmony:
+            self._vocab.setdefault("<|call|>", 900)
+        self.eos_token = eos_token
+        self.unk_token_id = 0
+        self.eos_token_ids: set[int] = set()
+
+    def get_vocab(self):
+        return self._vocab
+
+    def convert_tokens_to_ids(self, token):
+        return self._vocab.get(token)
+
+    def add_eos_token(self, token):
+        tid = token if isinstance(token, int) else self._vocab.get(token)
+        if tid is None:
+            raise ValueError(token)
+        self.eos_token_ids.add(tid)
+
+
+def test_augment_eos_registers_chatml_terminator():
+    tok = EosTokenizer(vocab={"<|im_end|>": 151645})
+    engine._augment_eos(tok, None)
+    assert 151645 in tok.eos_token_ids
+
+
+def test_augment_eos_uses_declared_eos_string():
+    tok = EosTokenizer(vocab={"<|custom_end|>": 42}, eos_token="<|custom_end|>")
+    engine._augment_eos(tok, None)
+    assert 42 in tok.eos_token_ids
+
+
+def test_augment_eos_reads_generation_config(tmp_path):
+    (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": [7, 8]}))
+    tok = EosTokenizer()
+    engine._augment_eos(tok, str(tmp_path))
+    assert {7, 8} <= tok.eos_token_ids
+
+
+def test_augment_eos_generation_config_scalar(tmp_path):
+    (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": 7}))
+    tok = EosTokenizer()
+    engine._augment_eos(tok, str(tmp_path))
+    assert 7 in tok.eos_token_ids
+
+
+def test_augment_eos_skips_channel_separators_for_harmony():
+    # `<|end|>` is a Harmony channel separator, not a turn end; must not become eos.
+    tok = EosTokenizer(vocab={"<|end|>": 200}, harmony=True)
+    engine._augment_eos(tok, None)
+    assert 200 not in tok.eos_token_ids
+
+
+def test_augment_eos_noop_without_add_api():
+    # A tokenizer lacking add_eos_token (the fake load path) is left untouched.
+    engine._augment_eos(FakeTokenizer(), "/p")  # no raise
+
+
+def test_with_chat_stop_appends_terminator():
+    tok = EosTokenizer(eos_token="<|im_end|>")
+    out = engine._with_chat_stop(SamplingParams(stop=("X",)), tok)
+    assert out.stop == ("X", "<|im_end|>")
+
+
+def test_with_chat_stop_skips_when_already_present():
+    tok = EosTokenizer(eos_token="<|im_end|>")
+    params = SamplingParams(stop=("<|im_end|>",))
+    assert engine._with_chat_stop(params, tok) is params
+
+
+def test_with_chat_stop_skips_harmony():
+    tok = EosTokenizer(eos_token="<|return|>", harmony=True)
+    params = SamplingParams()
+    assert engine._with_chat_stop(params, tok) is params
+
+
+def test_augment_eos_swallows_add_failure():
+    # A declared eos string absent from the vocab makes add_eos_token raise; the
+    # failure is logged and skipped rather than aborting registration.
+    tok = EosTokenizer(vocab={"<|im_end|>": 9}, eos_token="<|not_in_vocab|>")
+    engine._augment_eos(tok, None)
+    assert tok.eos_token_ids == {9}  # curated `<|im_end|>` still registered
+
+
+def test_augment_eos_swallows_bad_generation_config(tmp_path):
+    (tmp_path / "generation_config.json").write_text("{ not json")
+    tok = EosTokenizer()
+    engine._augment_eos(tok, str(tmp_path))  # no raise
+    assert tok.eos_token_ids == set()
+
+
+def test_augment_eos_without_convert_api():
+    tok = EosTokenizer()
+    tok.convert_tokens_to_ids = None  # curated lookup impossible
+    engine._augment_eos(tok, None)  # returns cleanly
+
+
+def test_augment_eos_swallows_convert_failure():
+    tok = EosTokenizer()
+
+    def _boom(_token):
+        raise RuntimeError("vocab exploded")
+
+    tok.convert_tokens_to_ids = _boom
+    engine._augment_eos(tok, None)
+    assert tok.eos_token_ids == set()
