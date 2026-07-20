@@ -8,7 +8,8 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -23,6 +24,50 @@ logger = logging.getLogger("omlx")
 
 REAP_INTERVAL_SECONDS = 15
 _FALLBACK_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB when size can't be measured
+
+# All MLX work runs on this one dedicated thread. mlx-lm's generation stream is
+# thread-local (bound to the thread that first imports mlx_lm), so a token step
+# that lands on a different thread raises "There is no Stream(gpu, N) in current
+# thread." FastAPI's sync endpoints stream through the AnyIO threadpool, which
+# hops workers between tokens; pinning every mx.* call here keeps the stream on
+# one thread for the life of the process. GPU work is serial anyway, so this also
+# gives concurrent requests fair per-token interleaving.
+_MLX = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+
+
+def _run(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run `fn` on the MLX worker thread, blocking until it returns/raises.
+
+    The worker must never acquire `ModelManager._lock` or a model's `cache_lock`:
+    a caller may hold `_lock` while dispatching here (e.g. eviction calling
+    `clear_cache`), and a worker that blocked on that lock would deadlock.
+    """
+    return _MLX.submit(fn, *args, **kwargs).result()
+
+
+def _do_import() -> None:
+    import mlx.core  # noqa: F401  # ty: ignore[unresolved-import]
+    import mlx_lm  # noqa: F401  # __init__ pulls in .generate, birthing generation_stream
+
+    # Touch the KV-cache submodule too so its lazy import can't later fire on a
+    # caller thread and re-enter mlx_lm off the worker.
+    import mlx_lm.models.cache  # noqa: F401
+
+
+_mlx_ready = False
+
+
+def _ensure_mlx() -> None:
+    """Import mlx / mlx_lm on the worker thread so its stream is born there.
+
+    Idempotent. Must run before any other mlx_lm import on a caller thread
+    (`_generation_kwargs` imports `mlx_lm.sample_utils`, which re-enters
+    `mlx_lm`); the module cache makes later caller-thread imports no-ops.
+    """
+    global _mlx_ready
+    if not _mlx_ready:
+        _run(_do_import)
+        _mlx_ready = True
 
 
 @dataclass
@@ -54,15 +99,64 @@ class LoadedModelInfo:
     expires_at: float | None
 
 
+def _active_memory() -> int | None:
+    import mlx.core as mx  # ty: ignore[unresolved-import]
+
+    return int(mx.get_active_memory())
+
+
+def _clear_cache() -> None:
+    import mlx.core as mx  # ty: ignore[unresolved-import]
+
+    mx.clear_cache()
+
+
+def _seed(value: int) -> None:
+    import mlx.core as mx  # ty: ignore[unresolved-import]
+
+    mx.random.seed(value)
+
+
+def _next_step(gen: Iterator[Any]) -> tuple[Any, bool]:
+    """One generation step. Returns (item, done); `done` marks exhaustion.
+
+    StopIteration is caught here rather than crossing the executor boundary,
+    where a future would surface it as an opaque error.
+    """
+    try:
+        return next(gen), False
+    except StopIteration:
+        return None, True
+
+
+def _iter_on_worker(make_gen: Callable[[], Iterator[Any]]) -> Generator[Any, None, None]:
+    """Drive an mlx-lm generator on the MLX worker, yielding each step here.
+
+    Every touch of `gen` — construction (which imports `stream_generate`), each
+    `next()` (one GPU eval), and `close()` (whose `__exit__` calls
+    `mx.synchronize(generation_stream)`) — runs on the worker thread, so the
+    thread-local generation stream stays valid. Only plain result data crosses
+    back to the caller.
+    """
+    gen = _run(make_gen)
+    try:
+        while True:
+            resp, done = _run(_next_step, gen)
+            if done:
+                return
+            yield resp
+    finally:
+        _run(gen.close)
+
+
 def _metal_active_memory() -> int | None:
     """Resident Metal memory in bytes, or None if unavailable.
 
-    Lazily imported; absence (non-Apple-Silicon, stubbed tests) is tolerated.
+    Queried on the MLX worker thread; absence (non-Apple-Silicon, stubbed tests)
+    is tolerated.
     """
     try:
-        import mlx.core as mx  # ty: ignore[unresolved-import]
-
-        return int(mx.get_active_memory())
+        return _run(_active_memory)
     except Exception as e:
         logger.debug("get_active_memory failed: %s", e)
         return None
@@ -167,6 +261,7 @@ class ModelManager:
                 lm.last_used = time.time()
                 return lm
 
+        _ensure_mlx()
         source = self._resolve(name)
         entry = registry.get(name)
 
@@ -185,13 +280,20 @@ class ModelManager:
             self._evict_to_count_locked()
 
         # Load outside the lock: a cold pull/load can take minutes, and holding
-        # the lock would block /health the whole time.
+        # the lock would block /health the whole time. The load runs on the MLX
+        # worker so the weights' arrays are created on the same thread that will
+        # later generate against them.
         baseline = _metal_active_memory()
-        from mlx_lm import load
 
-        # load() returns (model, tokenizer), plus a config when return_config is
-        # set; star-unpack tolerates either arity.
-        model, tokenizer, *_ = load(source)
+        def _load() -> tuple[Any, Any]:
+            from mlx_lm import load
+
+            # load() returns (model, tokenizer), plus a config when return_config
+            # is set; star-unpack tolerates either arity.
+            model, tokenizer, *_ = load(source)
+            return model, tokenizer
+
+        model, tokenizer = _run(_load)
         post = _metal_active_memory()
         size_bytes = _estimate_size_bytes(baseline, post, entry)
 
@@ -221,9 +323,7 @@ class ModelManager:
             if self._loaded.pop(name, None) is None:
                 return
         try:
-            import mlx.core as mx  # ty: ignore[unresolved-import]
-
-            mx.clear_cache()
+            _run(_clear_cache)
         except Exception as e:
             logger.debug("clear_cache failed on unload: %s", e)
 
@@ -359,23 +459,26 @@ class ModelManager:
         prepended to the logits-processor chain (before the penalty processors)
         to constrain output to valid JSON.
         """
-        from mlx_lm import stream_generate
-
+        _ensure_mlx()
         if params.seed is not None:
-            import mlx.core as mx  # ty: ignore[unresolved-import]
-
-            mx.random.seed(params.seed)
+            _run(_seed, params.seed)
         kwargs = _generation_kwargs(params, json_provider=json_provider)
         prompt_arg, offset, cache, tokens = self._prepare_cache(lm, prompt, use_cache)
         if cache is not None:
             kwargs["prompt_cache"] = cache
-        gen = stream_generate(
-            lm.model,
-            lm.tokenizer,
-            prompt=prompt_arg,
-            max_tokens=params.max_tokens,
-            **kwargs,
-        )
+
+        def _make_gen() -> Iterator[Any]:
+            from mlx_lm import stream_generate
+
+            return stream_generate(
+                lm.model,
+                lm.tokenizer,
+                prompt=prompt_arg,
+                max_tokens=params.max_tokens,
+                **kwargs,
+            )
+
+        gen = _iter_on_worker(_make_gen)
         try:
             with self._active_generation(lm):
                 if not params.stop:
@@ -385,6 +488,10 @@ class ModelManager:
                     for comp in _stream_with_stops(gen, params.stop):
                         yield _with_offset(comp, offset)
         finally:
+            # Close the wrapper (even on early client disconnect) so the mlx
+            # generator's exit — which synchronizes the generation stream — runs
+            # on the worker rather than at GC time on some other thread.
+            gen.close()
             if tokens is not None:
                 self._finalize_cache(lm, cache, tokens)
                 lm.cache_lock.release()
@@ -406,25 +513,33 @@ class ModelManager:
         if not lm.cache_lock.acquire(blocking=False):
             return prompt, 0, None, None
         try:
-            import mlx.core as mx  # ty: ignore[unresolved-import]
-            from mlx_lm.models.cache import (
-                can_trim_prompt_cache,
-                make_prompt_cache,
-                trim_prompt_cache,
-            )
-
             tokens = _encode_prompt(lm.tokenizer, prompt)
             if len(tokens) < 2:
                 lm.cache_lock.release()
                 return prompt, 0, None, None
-            cache = lm.cache
-            if cache is None or not can_trim_prompt_cache(cache):
-                cache = make_prompt_cache(lm.model)
+
+            def _setup(existing: Any, base_tokens: list[int]) -> tuple[Any, bool, int, Any]:
+                import mlx.core as mx  # ty: ignore[unresolved-import]
+                from mlx_lm.models.cache import (
+                    can_trim_prompt_cache,
+                    make_prompt_cache,
+                    trim_prompt_cache,
+                )
+
+                cache = existing
+                fresh = cache is None or not can_trim_prompt_cache(cache)
+                if fresh:
+                    cache = make_prompt_cache(lm.model)
+                    base_tokens = []
+                # Reuse the longest common prefix, but keep >=1 token to prefill.
+                common = min(_lcp(base_tokens, tokens), len(tokens) - 1)
+                trim_prompt_cache(cache, len(base_tokens) - common)
+                return cache, fresh, common, mx.array(tokens[common:])
+
+            cache, fresh, common, prompt_arg = _run(_setup, lm.cache, lm.cache_tokens)
+            if fresh:
                 lm.cache, lm.cache_tokens = cache, []
-            # Reuse the longest common prefix, but keep >=1 token to prefill.
-            common = min(_lcp(lm.cache_tokens, tokens), len(tokens) - 1)
-            trim_prompt_cache(cache, len(lm.cache_tokens) - common)
-            return mx.array(tokens[common:]), common, cache, tokens
+            return prompt_arg, common, cache, tokens
         except Exception as e:
             logger.debug("prompt-cache setup failed (%s); prefilling full prompt", e)
             lm.cache_lock.release()
@@ -438,16 +553,22 @@ class ModelManager:
         (e.g. quantized past the KV-quant threshold) is dropped rather than left
         inconsistent.
         """
-        try:
+
+        def _trim() -> bool:
             from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
 
             if not can_trim_prompt_cache(cache):
-                lm.cache, lm.cache_tokens = None, []
-                return
+                return False
             extra = cache[0].offset - len(tokens)
             if extra > 0:
                 trim_prompt_cache(cache, extra)
-            lm.cache, lm.cache_tokens = cache, tokens
+            return True
+
+        try:
+            if _run(_trim):
+                lm.cache, lm.cache_tokens = cache, tokens
+            else:
+                lm.cache, lm.cache_tokens = None, []
         except Exception as e:
             logger.debug("prompt-cache finalize failed (%s); dropping cache", e)
             lm.cache, lm.cache_tokens = None, []

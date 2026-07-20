@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import types
 
 import pytest
@@ -61,10 +62,12 @@ def fake_mlx(monkeypatch):
     `get_active_memory()` is a monotonic counter incremented on each `load`,
     so size-backfill tests can drive deterministic deltas without Metal.
     """
-    calls = {"load": 0, "active_mem": 0, "seed": -1}  # seed -1 = "not applied"
+    # seed -1 = "not applied"; `threads` records the worker each mlx call ran on.
+    calls = {"load": 0, "active_mem": 0, "seed": -1, "threads": []}
 
     def load(source):
         calls["load"] += 1
+        calls["threads"].append(threading.current_thread().name)
         # Simulate weights landing in Metal memory: each load adds 512 MiB.
         calls["active_mem"] += 512 * 1024 * 1024
         return object(), FakeTokenizer()
@@ -73,12 +76,14 @@ def fake_mlx(monkeypatch):
         # Record the prefilled token count and advance the (optional) cache the
         # way real generation would: prompt tokens, then one per generated token.
         calls["last_prompt_len"] = _plen(prompt)
+        calls["threads"].append(threading.current_thread().name)
         cache = kwargs.get("prompt_cache")
         if cache is not None:
             cache[0].offset += _plen(prompt)
         for i, (text, finish) in enumerate((("a", None), ("b", "stop"))):
             if cache is not None:
                 cache[0].offset += 1
+            calls["threads"].append(threading.current_thread().name)
             yield types.SimpleNamespace(
                 text=text,
                 finish_reason=finish,
@@ -217,6 +222,28 @@ def test_stream_text_yields_completions(fake_mlx, make_entry):
     out = list(mgr.stream_text("A", "hello", SamplingParams(max_tokens=8)))
     assert "".join(c.text for c in out) == "ab"
     assert out[-1].finish_reason == "stop"
+
+
+def test_mlx_work_runs_on_dedicated_worker_thread(fake_mlx, make_entry):
+    """Load and every generation step run on the one MLX worker, never the caller.
+
+    mlx-lm's generation stream is thread-local; if a token step ran on a
+    different thread than the one that made the stream, real MLX would raise
+    "There is no Stream(gpu, N) in current thread." Pinning all mx.* work to a
+    single worker is what prevents that, so guard the affinity here.
+    """
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    mgr = ModelManager(start_reaper=False)
+
+    caller = threading.current_thread().name
+    list(mgr.stream_text("A", "hello", SamplingParams(max_tokens=8)))
+
+    threads = fake_mlx["threads"]
+    # load + generator construction + one entry per generated token.
+    assert len(threads) >= 3
+    assert all(name.startswith("mlx") for name in threads)
+    assert caller not in threads
+    assert len(set(threads)) == 1  # the same worker across every step
 
 
 def test_generation_kwargs_forwards_sampling(fake_mlx, monkeypatch):
