@@ -386,9 +386,14 @@ class ModelManager:
 
         Output passes through the Harmony parser: the analysis channel is split
         from the final answer and control tokens are stripped. Inert for
-        non-reasoning models. When `tools` is given and the tokenizer supports
-        tool calling, tools are offered to the template and tool-call spans in
-        the output are parsed into OpenAI `tool_calls`. When `response_format`
+        non-reasoning models. Models whose reasoning is delimited by literal
+        ``<think>``/``</think>`` markers (Qwen3, Hermes 4) instead run in thinking
+        mode (`thinking=True` for Hermes-style templates) and pass through the
+        think parser, which routes the marked span to reasoning. When `tools`
+        is given and the tokenizer supports tool calling, tools are offered to the
+        template and tool-call spans in the output are parsed into OpenAI
+        `tool_calls`; a `tools` request to a model without tool support is logged
+        and ignored. When `response_format`
         carries ``{"type": "json_object"}`` (already validated by the HTTP
         layer) a JSON-mask logits processor is added to constrain output to a
         valid JSON value (Harmony-channel-aware; see :mod:`omlx._json`).
@@ -399,9 +404,20 @@ class ModelManager:
         # its calls are parsed from the commentary channel in `_parse_harmony`.
         generic_tools = bool(tools) and getattr(tok, "has_tool_calling", False)
         offer_tools = bool(tools) and (generic_tools or is_harmony(tok))
+        if tools and not offer_tools:
+            logger.warning(
+                "model %r has no tool-calling support; ignoring %d requested tool(s)",
+                name,
+                len(tools),
+            )
+        thinking = bool(getattr(tok, "has_thinking", False)) and not is_harmony(tok)
         template_kwargs: dict[str, Any] = {"add_generation_prompt": True, "tokenize": False}
         if offer_tools:
             template_kwargs["tools"] = tools
+        if thinking:
+            # mlx-lm injects `enable_thinking`; Hermes-style templates read `thinking`.
+            template_kwargs["thinking"] = True
+            messages = _thinking_safe_history(messages, tok.think_start, tok.think_end)
         prompt = tok.apply_chat_template(messages, **template_kwargs)
         json_mode = bool(response_format and response_format.get("type") == "json_object")
         stream = _parse_harmony(
@@ -413,6 +429,13 @@ class ModelManager:
                 json_provider=_json_processor(tok) if json_mode else None,
             )
         )
+        if thinking:
+            stream = _parse_think(
+                stream,
+                tok.think_start,
+                tok.think_end,
+                _prompt_opens_think(prompt, tok.think_start, tok.think_end),
+            )
         if generic_tools:
             stream = _parse_tool_calls(
                 stream,
@@ -985,6 +1008,128 @@ def _parse_harmony(chunks: Iterator[Completion]) -> Iterator[Completion]:
                 prompt_tokens=chunk.prompt_tokens,
                 completion_tokens=chunk.completion_tokens,
                 tool_calls=tuple(calls),
+            )
+
+
+class _ThinkParser:
+    """Streaming splitter for ``<think>``/``</think>`` reasoning (Qwen3, Hermes 4).
+
+    Text between the markers routes to reasoning, the rest to content; both
+    markers are stripped. ``start_in_think`` seeds the in-think state for
+    templates that prefill an opening marker in the generation prompt. Inert for
+    output that never contains the markers: content passes through unchanged.
+
+    Feed deltas with :meth:`push`; call :meth:`flush` once the stream ends to
+    release any tail withheld while disambiguating a marker split across chunks.
+    """
+
+    def __init__(self, start: str, end: str, start_in_think: bool = False) -> None:
+        self._buf = ""
+        self._start = start
+        self._end = end
+        self._markers = (start, end)
+        self._in_think = start_in_think
+
+    def push(self, text: str) -> tuple[str, str]:
+        """Consume `text`; return (content_delta, reasoning_delta)."""
+        self._buf += text
+        return self._scan(final=False)
+
+    def flush(self) -> tuple[str, str]:
+        """Release any withheld tail at end of stream."""
+        return self._scan(final=True)
+
+    def _emit(self, text: str, content: list[str], reasoning: list[str]) -> None:
+        (reasoning if self._in_think else content).append(text)
+
+    def _match(self, i: int) -> str | None:
+        for tok in self._markers:
+            if self._buf.startswith(tok, i):
+                return tok
+        return None
+
+    def _is_partial(self, i: int) -> bool:
+        frag = self._buf[i:]
+        return any(tok.startswith(frag) for tok in self._markers)
+
+    def _scan(self, final: bool) -> tuple[str, str]:
+        content: list[str] = []
+        reasoning: list[str] = []
+        buf = self._buf
+        i, n = 0, len(buf)
+        while i < n:
+            j = buf.find("<", i)
+            if j == -1:
+                self._emit(buf[i:], content, reasoning)
+                i = n
+                break
+            if j > i:
+                self._emit(buf[i:j], content, reasoning)
+                i = j
+            tok = self._match(i)
+            if tok is not None:
+                self._in_think = tok == self._start
+                i += len(tok)
+                continue
+            if not final and self._is_partial(i):
+                break  # a marker may be split across chunks; withhold it
+            self._emit(buf[i], content, reasoning)  # a literal '<'
+            i += 1
+        self._buf = buf[i:]
+        return "".join(content), "".join(reasoning)
+
+
+def _thinking_safe_history(
+    messages: list[dict[str, Any]], start: str, end: str
+) -> list[dict[str, Any]]:
+    """Give each assistant message an `end` marker for thinking-mode templates.
+
+    Thinking-mode chat templates slice prior assistant turns on the think-end
+    marker to drop the chain-of-thought from history (e.g. Hermes 4's
+    ``content.split('</think>', 1)[1]``). Reasoning-stripped content — what the
+    think parser leaves in `content` — carries no marker and makes that slice
+    raise. Prepend an empty ``start+end`` so the slice yields the answer unchanged.
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content") or ""
+        if m.get("role") == "assistant" and content and end not in content:
+            m = {**m, "content": start + end + content}
+        out.append(m)
+    return out
+
+
+def _prompt_opens_think(prompt: str, start: str, end: str) -> bool:
+    """True when `prompt` ends inside an open think block (template prefilled it)."""
+    last_start = prompt.rfind(start)
+    return last_start != -1 and prompt.rfind(end) < last_start
+
+
+def _parse_think(
+    chunks: Iterator[Completion], start: str, end: str, start_in_think: bool
+) -> Iterator[Completion]:
+    """Re-emit `chunks` with ``<think>``/``</think>`` spans split into reasoning.
+
+    Mirrors :func:`_parse_harmony` for models whose reasoning is delimited by
+    literal think markers rather than Harmony channels. Markers are stripped; the
+    terminal chunk's `finish_reason` and token counts are preserved.
+    """
+    parser = _ThinkParser(start, end, start_in_think)
+    for chunk in chunks:
+        content, reasoning = parser.push(chunk.text)
+        terminal = chunk.finish_reason is not None
+        if terminal:
+            tail_content, tail_reasoning = parser.flush()
+            content += tail_content
+            reasoning += tail_reasoning
+        if content or reasoning or terminal:
+            yield Completion(
+                text=content,
+                reasoning=reasoning,
+                finish_reason=chunk.finish_reason,
+                prompt_tokens=chunk.prompt_tokens,
+                completion_tokens=chunk.completion_tokens,
+                tool_calls=chunk.tool_calls,
             )
 
 

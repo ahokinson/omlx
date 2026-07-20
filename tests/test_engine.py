@@ -508,6 +508,145 @@ def test_harmony_preserves_literal_angle_brackets(fake_mlx, make_entry, monkeypa
     assert "".join(c.text for c in out) == "a <| b < c"
 
 
+class FakeThinkTokenizer(_EncTokenizer):
+    """A `<think>`-delimited reasoning tokenizer (Qwen3 / Hermes 4 style)."""
+
+    has_thinking = True
+    think_start = "<think>"
+    think_end = "</think>"
+
+    def __init__(self):
+        self.template_kwargs = None
+        self.seen_messages = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.template_kwargs = kwargs
+        self.seen_messages = messages
+        return "PROMPT:" + messages[-1]["content"]
+
+
+class FakeThinkPrefillTokenizer(FakeThinkTokenizer):
+    """A think tokenizer whose template prefills an opening `<think>` marker."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.template_kwargs = kwargs
+        self.seen_messages = messages
+        return "PROMPT:" + messages[-1]["content"] + "<think>"
+
+
+def _load_think_tokenizer(monkeypatch, tok=None):
+    tok = tok or FakeThinkTokenizer()
+    monkeypatch.setattr(sys.modules["mlx_lm"], "load", lambda source: (object(), tok))
+    return tok
+
+
+def test_think_splits_reasoning_from_content(fake_mlx, make_entry, monkeypatch):
+    """`<think>...</think>` -> reasoning, the rest -> content, markers stripped."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_think_tokenizer(monkeypatch)
+    # One char per step: every marker is split across boundaries.
+    monkeypatch.setattr(
+        sys.modules["mlx_lm"], "stream_generate", _char_stream("<think>THINK</think>ANSWER")
+    )
+    out = _chat(ModelManager(start_reaper=False))
+    assert "".join(c.text for c in out) == "ANSWER"
+    assert "".join(c.reasoning for c in out) == "THINK"
+    assert "think>" not in "".join(c.text + c.reasoning for c in out)  # no leaked markers
+    assert out[-1].finish_reason == "stop"
+
+
+def test_think_marker_split_across_chunks(fake_mlx, make_entry, monkeypatch):
+    """Multi-char chunks that bisect the markers still parse cleanly."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_think_tokenizer(monkeypatch)
+    chunks = ["<thi", "nk>TH", "INK</thi", "nk>ANS", "WER"]
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _chunk_stream(chunks))
+    out = _chat(ModelManager(start_reaper=False))
+    assert "".join(c.text for c in out) == "ANSWER"
+    assert "".join(c.reasoning for c in out) == "THINK"
+
+
+def test_think_parser_inert_without_markers(fake_mlx, make_entry, monkeypatch):
+    """A think model that emits no markers yields plain content, no reasoning."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_think_tokenizer(monkeypatch)
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream("hello"))
+    out = _chat(ModelManager(start_reaper=False))
+    assert "".join(c.text for c in out) == "hello"
+    assert all(c.reasoning == "" for c in out)
+
+
+def test_think_prefilled_open_marker(fake_mlx, make_entry, monkeypatch):
+    """A template that prefills `<think>` starts the stream in reasoning."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    _load_think_tokenizer(monkeypatch, FakeThinkPrefillTokenizer())
+    monkeypatch.setattr(
+        sys.modules["mlx_lm"], "stream_generate", _char_stream("THINK</think>ANSWER")
+    )
+    out = _chat(ModelManager(start_reaper=False))
+    assert "".join(c.text for c in out) == "ANSWER"
+    assert "".join(c.reasoning for c in out) == "THINK"
+
+
+def test_thinking_mode_flag_passed_to_template(fake_mlx, make_entry, monkeypatch):
+    """A think model runs the template in thinking mode (`thinking=True`)."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    tok = _load_think_tokenizer(monkeypatch)
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream("hi"))
+    _chat(ModelManager(start_reaper=False))
+    assert tok.template_kwargs["thinking"] is True
+
+
+def test_thinking_safe_history_wraps_stripped_assistant():
+    """Assistant content without a think-end marker gets an empty sentinel prefix."""
+    from omlx.engine import _thinking_safe_history
+
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "clean answer"},
+        {"role": "assistant", "content": "<think>x</think>kept"},
+        {"role": "assistant", "content": "", "tool_calls": [{"x": 1}]},
+    ]
+    out = _thinking_safe_history(msgs, "<think>", "</think>")
+    assert out[1]["content"] == "<think></think>clean answer"  # sentinel added
+    assert out[2]["content"] == "<think>x</think>kept"  # already has marker, untouched
+    assert out[3]["content"] == ""  # empty content (tool call) left alone
+    assert msgs[1]["content"] == "clean answer"  # original not mutated
+
+
+def test_thinking_safe_history_applied_in_stream_chat(fake_mlx, make_entry, monkeypatch):
+    """stream_chat feeds the sentinel-wrapped history to the template."""
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    tok = _load_think_tokenizer(monkeypatch)
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream("hi"))
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "again"},
+    ]
+    list(ModelManager(start_reaper=False).stream_chat("A", msgs, SamplingParams(max_tokens=8)))
+    assert tok.seen_messages[1]["content"] == "<think></think>answer"
+
+
+def test_tools_ignored_for_non_tool_model_logs_warning(fake_mlx, make_entry, monkeypatch, caplog):
+    """Requesting tools from a model without tool support warns and still generates."""
+    import logging
+
+    registry.add(make_entry(name="A", repo_id="org/A", path="/p"))
+    tok = _load_think_tokenizer(monkeypatch)
+    monkeypatch.setattr(sys.modules["mlx_lm"], "stream_generate", _char_stream("hi"))
+    tools = [{"type": "function", "function": {"name": "f"}}]
+    with caplog.at_level(logging.WARNING):
+        out = list(
+            ModelManager(start_reaper=False).stream_chat(
+                "A", [{"role": "user", "content": "hi"}], SamplingParams(max_tokens=8), tools=tools
+            )
+        )
+    assert "no tool-calling support" in caplog.text
+    assert tok.template_kwargs.get("tools") is None  # tools not offered to the template
+    assert "".join(c.text for c in out) == "hi"  # generation proceeds
+
+
 class FakeToolTokenizer(_EncTokenizer):
     """A tool-capable tokenizer: `<tool_call>`-delimited JSON, echoing tools passed."""
 
